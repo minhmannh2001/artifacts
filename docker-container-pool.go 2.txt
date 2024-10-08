@@ -1,0 +1,177 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log"
+	"sync"
+
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
+)
+
+type ContainerState int
+
+const (
+	Free ContainerState = iota
+	Busy
+)
+
+type ContainerInfo struct {
+	ID    string
+	State ContainerState
+}
+
+type ContainerPool struct {
+	client     *client.Client
+	containers map[string]*ContainerInfo
+	mutex      sync.Mutex
+	maxSize    int
+	freePool   chan string
+}
+
+func NewContainerPool(maxSize int) (*ContainerPool, error) {
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Docker client: %v", err)
+	}
+
+	return &ContainerPool{
+		client:     cli,
+		maxSize:    maxSize,
+		containers: make(map[string]*ContainerInfo),
+		freePool:   make(chan string, maxSize),
+	}, nil
+}
+
+func (p *ContainerPool) AddContainer(imageName string) error {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	if len(p.containers) >= p.maxSize {
+		return fmt.Errorf("pool is at maximum capacity")
+	}
+
+	ctx := context.Background()
+	resp, err := p.client.ContainerCreate(ctx, &container.Config{
+		Image: imageName,
+		Tty:   true,
+	}, nil, nil, nil, "")
+
+	if err != nil {
+		return fmt.Errorf("failed to create container: %v", err)
+	}
+
+	if err := p.client.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{}); err != nil {
+		return fmt.Errorf("failed to start container: %v", err)
+	}
+
+	p.containers[resp.ID] = &ContainerInfo{ID: resp.ID, State: Free}
+	p.freePool <- resp.ID
+	return nil
+}
+
+func (p *ContainerPool) RemoveContainer(containerID string) error {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	ctx := context.Background()
+	err := p.client.ContainerRemove(ctx, containerID, types.ContainerRemoveOptions{Force: true})
+	if err != nil {
+		return fmt.Errorf("failed to remove container: %v", err)
+	}
+
+	delete(p.containers, containerID)
+	return nil
+}
+
+func (p *ContainerPool) GetFreeContainer() (string, error) {
+	select {
+	case containerID := <-p.freePool:
+		p.mutex.Lock()
+		p.containers[containerID].State = Busy
+		p.mutex.Unlock()
+		return containerID, nil
+	default:
+		return "", fmt.Errorf("no free containers available")
+	}
+}
+
+func (p *ContainerPool) ReleaseContainer(containerID string) {
+	p.mutex.Lock()
+	if info, exists := p.containers[containerID]; exists && info.State == Busy {
+		info.State = Free
+		p.freePool <- containerID
+	}
+	p.mutex.Unlock()
+}
+
+func (p *ContainerPool) RunTaskInContainer(containerID string, input string) (string, error) {
+	ctx := context.Background()
+
+	execConfig := types.ExecConfig{
+		Cmd:          []string{"/bin/sh", "-c", input},
+		AttachStdin:  true,
+		AttachStdout: true,
+		AttachStderr: true,
+		Tty:          true,
+	}
+
+	execID, err := p.client.ContainerExecCreate(ctx, containerID, execConfig)
+	if err != nil {
+		return "", fmt.Errorf("failed to create exec: %v", err)
+	}
+
+	resp, err := p.client.ContainerExecAttach(ctx, execID.ID, types.ExecStartCheck{})
+	if err != nil {
+		return "", fmt.Errorf("failed to attach to exec: %v", err)
+	}
+	defer resp.Close()
+
+	output, err := io.ReadAll(resp.Reader)
+	if err != nil {
+		return "", fmt.Errorf("failed to read output: %v", err)
+	}
+
+	return string(output), nil
+}
+
+func main() {
+	pool, err := NewContainerPool(5)
+	if err != nil {
+		log.Fatalf("Failed to create container pool: %v", err)
+	}
+
+	// Add containers to the pool
+	for i := 0; i < 3; i++ {
+		err := pool.AddContainer("alpine:latest")
+		if err != nil {
+			log.Printf("Failed to add container: %v", err)
+		}
+	}
+
+	// Example usage
+	containerID, err := pool.GetFreeContainer()
+	if err != nil {
+		log.Fatalf("Failed to get free container: %v", err)
+	}
+
+	output, err := pool.RunTaskInContainer(containerID, "echo 'Hello from container'")
+	if err != nil {
+		log.Fatalf("Failed to run task in container: %v", err)
+	}
+
+	fmt.Printf("Task output: %s\n", output)
+
+	pool.ReleaseContainer(containerID)
+
+	// Clean up
+	for id := range pool.containers {
+		err := pool.RemoveContainer(id)
+		if err != nil {
+			log.Printf("Failed to remove container %s: %v", id, err)
+		}
+	}
+}
