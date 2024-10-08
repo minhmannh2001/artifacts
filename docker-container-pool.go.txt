@@ -1,0 +1,107 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"sync"
+
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/client"
+)
+
+type ContainerPool struct {
+	client     *client.Client
+	containers []string
+	mutex      sync.Mutex
+	maxSize    int
+}
+
+func NewContainerPool(maxSize int) (*ContainerPool, error) {
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Docker client: %v", err)
+	}
+
+	return &ContainerPool{
+		client:  cli,
+		maxSize: maxSize,
+	}, nil
+}
+
+func (p *ContainerPool) AddContainer(imageName string) error {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	if len(p.containers) >= p.maxSize {
+		return fmt.Errorf("pool is at maximum capacity")
+	}
+
+	ctx := context.Background()
+	resp, err := p.client.ContainerCreate(ctx, &container.Config{
+		Image: imageName,
+	}, nil, nil, nil, "")
+
+	if err != nil {
+		return fmt.Errorf("failed to create container: %v", err)
+	}
+
+	if err := p.client.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{}); err != nil {
+		return fmt.Errorf("failed to start container: %v", err)
+	}
+
+	p.containers = append(p.containers, resp.ID)
+	return nil
+}
+
+func (p *ContainerPool) RemoveContainer(containerID string) error {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	ctx := context.Background()
+	err := p.client.ContainerRemove(ctx, containerID, types.ContainerRemoveOptions{Force: true})
+	if err != nil {
+		return fmt.Errorf("failed to remove container: %v", err)
+	}
+
+	for i, id := range p.containers {
+		if id == containerID {
+			p.containers = append(p.containers[:i], p.containers[i+1:]...)
+			break
+		}
+	}
+
+	return nil
+}
+
+func (p *ContainerPool) ListContainers() []string {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	return append([]string{}, p.containers...)
+}
+
+func main() {
+	pool, err := NewContainerPool(5)
+	if err != nil {
+		log.Fatalf("Failed to create container pool: %v", err)
+	}
+
+	// Example usage
+	err = pool.AddContainer("nginx:latest")
+	if err != nil {
+		log.Printf("Failed to add container: %v", err)
+	}
+
+	containers := pool.ListContainers()
+	fmt.Println("Containers in the pool:", containers)
+
+	// Remember to clean up containers when done
+	for _, containerID := range containers {
+		err := pool.RemoveContainer(containerID)
+		if err != nil {
+			log.Printf("Failed to remove container %s: %v", containerID, err)
+		}
+	}
+}
