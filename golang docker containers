@@ -1,0 +1,513 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"log"
+	"os"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/client"
+	"github.com/spf13/viper"
+)
+
+type ContainerState int
+
+const (
+	Free ContainerState = iota
+	Busy
+)
+
+type ContainerInfo struct {
+	ID     string
+	State  ContainerState
+	Tenant string
+	Stdin  io.WriteCloser
+	Stdout *bufio.Scanner
+}
+
+type OutputContainer struct {
+	Type        string                 `json:"type,omitempty"`
+	ErrMessage  string                 `json:"error_message"`
+	Message     string                 `json:"message"`
+	Results     map[string]interface{} `json:"results"`
+	ResultsType map[string]interface{} `json:"results_type"`
+	Integration string                 `json:"integration"`
+	Script      string                 `json:"script"`
+	Command     string                 `json:"command"`
+	Instance    string                 `json:"instance"`
+	Args        interface{}            `json:"args"`
+}
+
+type Context struct {
+	Script        string      `json:"script,omitempty"`
+	Command       string      `json:"command"`
+	Args          interface{} `json:"args"`
+	Params        interface{} `json:"params"`
+	Native        bool        `json:"native"`
+	IntegrationId string      `json:"integrationid"`
+}
+
+type ContainerPool struct {
+	client           *client.Client
+	containers       map[string]*ContainerInfo
+	mutex            sync.Mutex
+	maxSize          int
+	freePool         chan string
+	processedTenants map[string]bool
+}
+
+func NewContainerPool(maxSize int) (*ContainerPool, error) {
+	cli, err := client.NewClientWithOpts(client.FromEnv)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Docker client: %v", err)
+	}
+
+	return &ContainerPool{
+		client:           cli,
+		maxSize:          maxSize,
+		containers:       make(map[string]*ContainerInfo),
+		freePool:         make(chan string, maxSize),
+		processedTenants: make(map[string]bool),
+	}, nil
+}
+
+func (p *ContainerPool) ListenForTenants(tenantChan <-chan string) {
+	for tenant := range tenantChan {
+		p.mutex.Lock()
+		if !p.processedTenants[tenant] {
+			p.processedTenants[tenant] = true
+			p.mutex.Unlock()
+			go p.createContainersForTenant(tenant)
+		} else {
+			p.mutex.Unlock()
+		}
+	}
+}
+
+func (p *ContainerPool) createContainersForTenant(tenant string) {
+	numInstances := viper.GetInt("worker.numberOfInstances")
+	for i := 0; i < numInstances; i++ {
+		containerName := fmt.Sprintf("datafeed_worker_%s_tenant_%s", strconv.Itoa(i), tenant)
+		err := p.createContainer(containerName, tenant)
+		if err != nil {
+			log.Printf("Failed to create container for tenant %s: %v", tenant, err)
+		}
+	}
+}
+
+func (p *ContainerPool) createContainer(name, tenant string) error {
+	ctx := context.Background()
+
+	// You may want to customize this configuration based on your needs
+	config := &container.Config{
+		Image: viper.GetString("worker.image"),
+		Env:   []string{fmt.Sprintf("TENANT=%s", tenant)},
+	}
+
+	hostConfig := &container.HostConfig{}
+
+	resp, err := p.client.ContainerCreate(ctx, config, hostConfig, nil, nil, name)
+	if err != nil {
+		return fmt.Errorf("failed to create container: %v", err)
+	}
+
+	if err := p.client.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		return fmt.Errorf("failed to start container: %v", err)
+	}
+
+	p.mutex.Lock()
+	p.containers[resp.ID] = &ContainerInfo{
+		ID:    resp.ID,
+		State: Free,
+	}
+	p.freePool <- resp.ID
+	p.mutex.Unlock()
+
+	log.Printf("Created and started container %s for tenant %s", name, tenant)
+	return nil
+}
+
+func (p *ContainerPool) AddContainer(imageName string) error {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	if len(p.containers) >= p.maxSize {
+		return fmt.Errorf("pool is at maximum capacity")
+	}
+
+	ctx := context.Background()
+
+	// Prepare container configuration
+	config := &container.Config{
+		Image:     viper.GetString("worker.image"),
+		Cmd:       []string{"/bin/sh"},
+		Tty:       false,
+		OpenStdin: true,
+		Env:       []string{},
+	}
+
+	// Prepare host configuration
+	hostConfig := &container.HostConfig{
+		AutoRemove: true,
+		LogConfig: container.LogConfig{
+			Type: "json-file",
+			Config: map[string]string{
+				"max-size": "2m",
+			},
+		},
+	}
+
+	// Network configuration
+	networkingConfig := &network.NetworkingConfig{}
+	if networkName := viper.GetString("network.name"); networkName != "" {
+		networkingConfig.EndpointsConfig = map[string]*network.EndpointSettings{
+			networkName: {
+				NetworkID: networkName,
+			},
+		}
+	}
+
+	// DNS configuration
+	dns := viper.GetStringSlice("network.dns")
+	dnsSearch := viper.GetStringSlice("network.dns_search")
+	dnsOpts := viper.GetStringSlice("dns_opt")
+	hostConfig.DNS = dns
+	hostConfig.DNSSearch = dnsSearch
+	hostConfig.DNSOptions = dnsOpts
+
+	// Extra hosts
+	hosts := viper.GetStringSlice("network.hosts")
+	hostConfig.ExtraHosts = hosts
+
+	// Environment variables
+	envs := viper.GetStringMap("environments")
+	for env, value := range envs {
+		config.Env = append(config.Env, fmt.Sprintf("%s=%s", env, value))
+	}
+
+	// Tenant tokens
+	tenantToken, tenantDatafeedToken := GetTokenByAgentMode("")
+	if tenantToken == "" && tenantDatafeedToken == "" {
+		return fmt.Errorf("no valid tokens found for tenant")
+	}
+	if tenantToken != "" {
+		config.Env = append(config.Env, tenantToken)
+	}
+	if tenantDatafeedToken != "" {
+		config.Env = append(config.Env, tenantDatafeedToken)
+	}
+
+	// Certificate volume
+	if certPath := viper.GetString("agentCert.path"); certPath != "" {
+		hostConfig.Binds = []string{fmt.Sprintf("%s:/opt/ssl_cert.pem", certPath)}
+		config.Env = append(config.Env, "cert=/opt/ssl_cert.pem")
+	}
+
+	resp, err := p.client.ContainerCreate(ctx, config, hostConfig, networkingConfig, nil, "")
+
+	if err != nil {
+		return fmt.Errorf("failed to create container: %v", err)
+	}
+
+	if err := p.client.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		return fmt.Errorf("failed to start container: %v", err)
+	}
+
+	containerInfo := &ContainerInfo{
+		ID:    resp.ID,
+		State: Free,
+	}
+
+	err = p.attachStreams(containerInfo)
+
+	if err != nil {
+		return fmt.Errorf("failed to attach streams: %v", err)
+	}
+
+	p.mutex.Lock()
+	p.containers[resp.ID] = containerInfo
+	p.freePool <- resp.ID
+	p.mutex.Unlock()
+
+	go p.runContainerForever(containerInfo)
+
+	return nil
+}
+
+func GetTokenByAgentMode(tenant string) (string, string) {
+
+	// tenantToken := ""
+
+	// tenantDatafeedToken := ""
+
+	// var err error
+
+	// agentMode := viper.GetString("agent.mode")
+
+	// if agentMode == Server {
+	// 	sessionToken := viper.GetString("gatekeeper.sessionToken")
+	// 	baseUri := viper.GetString("gatekeeper.uri")
+	// 	permission := viper.GetString("gatekeeper.permission")
+	// 	clientId := viper.GetString("gatekeeper.clientId")
+	// 	tenantToken, err = helpers.GetAccessTokenViaClientCredentialFlow(
+	// 		baseUri,
+	// 		sessionToken,
+	// 		clientId,
+	// 		permission,
+	// 		tenant,
+	// 	)
+
+	// 	if err != nil {
+	// 		logz.Error(
+	// 			"GetAccessTokenViaClientCredentialFlow",
+	// 			zap.Error(err),
+	// 			zap.String("audience", clientId),
+	// 			zap.String("permission", permission),
+	// 			zap.String("tenant", tenant),
+	// 		)
+	// 	}
+	// 	tenantDatafeedToken = tenantToken
+	// } else {
+	// 	tenantToken = viper.GetString(fmt.Sprintf("tenant.%s_token", strings.ToLower(tenant)))
+	// 	tenantDatafeedToken = viper.GetString(fmt.Sprintf("tenant.%s_token_datafeed", strings.ToLower(tenant)))
+	// }
+
+	// if tenantToken != "" {
+	// 	tenantToken = fmt.Sprintf("%s=%s", "orenctl_api_key", tenantToken)
+	// }
+
+	// if tenantDatafeedToken != "" {
+	// 	tenantDatafeedToken = fmt.Sprintf("%s=%s", "datafeed_api_token", tenantDatafeedToken)
+	// }
+
+	// return tenantToken, tenantDatafeedToken
+	return "TENANT_TOKEN=your_token", "DATAFEED_TOKEN=your_datafeed_token"
+}
+
+func (p *ContainerPool) attachStreams(info *ContainerInfo) error {
+	ctx := context.Background()
+	opts := container.AttachOptions{
+		Stream: true,
+		Stdin:  true,
+		Stdout: true,
+		Stderr: true,
+	}
+
+	conn, err := p.client.ContainerAttach(ctx, info.ID, opts)
+	if err != nil {
+		return fmt.Errorf("failed to attach to container: %v", err)
+	}
+
+	info.Stdin = conn.Conn
+
+	// Use a custom reader that can handle both headerless and headered streams
+	reader := &adaptiveReader{reader: conn.Reader}
+	info.Stdout = bufio.NewScanner(reader)
+
+	return nil
+}
+
+type adaptiveReader struct {
+	reader io.Reader
+	buffer []byte
+}
+
+func (ar *adaptiveReader) Read(p []byte) (int, error) {
+	if len(ar.buffer) > 0 {
+		n := copy(p, ar.buffer)
+		ar.buffer = ar.buffer[n:]
+		return n, nil
+	}
+
+	header := make([]byte, 8)
+	n, err := io.ReadFull(ar.reader, header)
+	if err != nil {
+		if err == io.EOF && n > 0 {
+			// If we got a partial header, it's probably just regular data
+			return copy(p, header[:n]), nil
+		}
+		return 0, err
+	}
+
+	// Check if this looks like a Docker stream header
+	if header[0] == 1 || header[0] == 2 {
+		size := int(binary.BigEndian.Uint32(header[4:]))
+		data := make([]byte, size)
+		_, err = io.ReadFull(ar.reader, data)
+		if err != nil {
+			return 0, err
+		}
+		n = copy(p, data)
+		if n < len(data) {
+			ar.buffer = data[n:]
+		}
+		return n, nil
+	}
+
+	// If it doesn't look like a header, treat it as regular data
+	n = copy(p, header)
+	if n < len(header) {
+		ar.buffer = header[n:]
+	}
+	return n, nil
+}
+
+func (p *ContainerPool) runContainerForever(info *ContainerInfo) {
+	ctx := context.Background()
+	statusCh, errCh := p.client.ContainerWait(ctx, info.ID, container.WaitConditionNotRunning)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			log.Printf("Error waiting for container %s: %v", info.ID, err)
+		}
+	case <-statusCh:
+	}
+}
+
+func (p *ContainerPool) RemoveContainer(containerID string) error {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+
+	info, exists := p.containers[containerID]
+	if !exists {
+		return fmt.Errorf("container %s not found in pool", containerID)
+	}
+
+	if info.Stdin != nil {
+		info.Stdin.Close()
+	}
+
+	ctx := context.Background()
+	err := p.client.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
+	if err != nil {
+		return fmt.Errorf("failed to remove container: %v", err)
+	}
+
+	delete(p.containers, containerID)
+	return nil
+}
+
+func (p *ContainerPool) GetFreeContainer() (string, error) {
+	select {
+	case containerID := <-p.freePool:
+		p.mutex.Lock()
+		p.containers[containerID].State = Busy
+		p.mutex.Unlock()
+		return containerID, nil
+	default:
+		return "", fmt.Errorf("no free containers available")
+	}
+}
+
+func (p *ContainerPool) ReleaseContainer(containerID string) {
+	p.mutex.Lock()
+	if info, exists := p.containers[containerID]; exists && info.State == Busy {
+		info.State = Free
+		p.freePool <- containerID
+	}
+	p.mutex.Unlock()
+}
+
+func (p *ContainerPool) WriteToContainer(containerID string, input string) error {
+	p.mutex.Lock()
+	info, exists := p.containers[containerID]
+	p.mutex.Unlock()
+
+	if !exists {
+		return fmt.Errorf("container %s not found", containerID)
+	}
+
+	_, err := info.Stdin.Write([]byte(input + "\n"))
+	return err
+}
+
+func (p *ContainerPool) ReadFromContainer(containerID string) error {
+	p.mutex.Lock()
+	info, exists := p.containers[containerID]
+	p.mutex.Unlock()
+
+	if !exists {
+		return fmt.Errorf("container %s not found", containerID)
+	}
+
+	for info.Stdout.Scan() {
+		data := info.Stdout.Bytes()
+		output := string(data)
+		fmt.Printf("Container output: %s\n", output)
+		if output == "Stop container" {
+			break
+		}
+	}
+
+	if err := info.Stdout.Err(); err != nil {
+		return fmt.Errorf("error reading container output: %v", err)
+	}
+
+	return nil
+}
+
+func main() {
+	os.Setenv("DOCKER_API_VERSION", "1.44")
+	pool, err := NewContainerPool(5)
+	if err != nil {
+		log.Fatalf("Failed to create container pool: %v", err)
+	}
+
+	// Add a container to the pool
+	err = pool.AddContainer("alpine:latest")
+	if err != nil {
+		log.Fatalf("Failed to add container: %v", err)
+	}
+
+	// Get a free container
+	containerID, err := pool.GetFreeContainer()
+	if err != nil {
+		log.Fatalf("Failed to get free container: %v", err)
+	}
+
+	go func() {
+		// Read the output from the container
+		err = pool.ReadFromContainer(containerID)
+		if err != nil {
+			log.Fatalf("Failed to read from container: %v", err)
+		}
+	}()
+
+	// Write a command to the container
+	err = pool.WriteToContainer(containerID, "echo 'Hello from container'")
+	if err != nil {
+		log.Fatalf("Failed to write to container: %v", err)
+	}
+
+	err = pool.WriteToContainer(containerID, "echo 'Hello from container'")
+	if err != nil {
+		log.Fatalf("Failed to write to container: %v", err)
+	}
+
+	err = pool.WriteToContainer(containerID, "echo 'Stop container'")
+	if err != nil {
+		log.Fatalf("Failed to write to container: %v", err)
+	}
+
+	time.Sleep(15 * time.Second)
+
+	// Release the container back to the pool
+	pool.ReleaseContainer(containerID)
+
+	// Clean up
+	for id := range pool.containers {
+		err := pool.RemoveContainer(id)
+		if err != nil {
+			log.Printf("Failed to remove container %s: %v", id, err)
+		}
+	}
+
+}
