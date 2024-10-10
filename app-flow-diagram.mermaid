@@ -1,0 +1,18 @@
+graph TD
+    A[Incoming Data] -->|Route| B[TenantRouter]
+    B -->|Consistent Hashing| C{Channel Selection}
+    C -->|Channel 1| D1[Worker Pool 1]
+    C -->|Channel 2| D2[Worker Pool 2]
+    C -->|Channel N| D3[Worker Pool N]
+    D1 -->|Get Container| E[Container Pool]
+    D2 -->|Get Container| E
+    D3 -->|Get Container| E
+    E -->|Process Data| F[Docker Container]
+    F -->|Return Result| G[Process Output]
+    G -->|Check for Failures| H{Circuit Breaker}
+    H -->|Failure| I[Increment Failure Count]
+    I -->|Threshold Reached| J[Trip Circuit Breaker]
+    H -->|Success| K[Reset Failure Count]
+    L[Work Stealing] -.->|Balance Load| D1
+    L -.->|Balance Load| D2
+    L -.->|Balance Load| D3
