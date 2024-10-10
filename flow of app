@@ -1,0 +1,13 @@
+This diagram illustrates the main components and flow of the application:
+
+Incoming Data: The entry point for data into the system.
+TenantRouter: Responsible for routing data to appropriate channels.
+Channel Selection: Uses consistent hashing to determine which channel to use.
+Worker Pools: Multiple worker pools process data concurrently.
+Container Pool: Manages a pool of Docker containers for processing.
+Docker Container: Where the actual data processing occurs.
+Process Output: Handles the results from the container.
+Circuit Breaker: Monitors failures and can trip to prevent overload.
+Work Stealing: Balances load across worker pools.
+
+The diagram shows how data flows through the system, from input to processing and output, including the load balancing and fault tolerance mechanisms in place.
