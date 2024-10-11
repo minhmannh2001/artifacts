@@ -1,0 +1,77 @@
+That's an interesting alternative approach. Marshalling the struct to a string and then measuring the size of that string can indeed give you an estimate of the total data size. This method is simpler and doesn't require using the unsafe package. Let's implement this using JSON marshalling:
+Here's how you can do it:
+goCopypackage main
+
+import (
+	"encoding/json"
+	"fmt"
+)
+
+type YourStruct struct {
+	Field1 int
+	Field2 string
+	Field3 []*float64
+}
+
+func getJSONSize(v interface{}) (int, error) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return 0, err
+	}
+	return len(data), nil
+}
+
+func main() {
+	instance := YourStruct{
+		Field1: 42,
+		Field2: "Hello, World!",
+		Field3: []*float64{new(float64), new(float64)},
+	}
+	*instance.Field3[0] = 3.14
+	*instance.Field3[1] = 2.71
+
+	size, err := getJSONSize(instance)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+	fmt.Printf("Size of the marshalled struct: %d bytes\n", size)
+}
+This approach has several advantages:
+
+It's simpler and doesn't require using the unsafe package.
+It captures the actual data content, including what's pointed to by pointers.
+It's less likely to have issues with padding or alignment.
+
+However, there are also some important considerations:
+
+The size you get is of the JSON representation, not the actual memory usage of the struct in Go. This can be larger or smaller than the in-memory size, depending on the data types and structure.
+JSON marshalling has some limitations:
+
+It only includes exported fields (those starting with a capital letter).
+Some types (like functions or channels) can't be marshalled to JSON.
+Circular references will cause an error.
+
+
+The size includes JSON syntax overhead (quotes, commas, braces, etc.).
+If your struct contains types that implement custom marshalling (i.e., they implement the json.Marshaler interface), the size might not accurately reflect the actual data size.
+This method involves allocating memory for the JSON string, which could be an issue for very large structures or in memory-constrained environments.
+
+If you want a more accurate representation of the Go data structures, you might consider using encoding/gob instead of JSON:
+goCopyimport (
+	"bytes"
+	"encoding/gob"
+	"fmt"
+)
+
+func getGobSize(v interface{}) (int, error) {
+	var buffer bytes.Buffer
+	enc := gob.NewEncoder(&buffer)
+	err := enc.Encode(v)
+	if err != nil {
+		return 0, err
+	}
+	return buffer.Len(), nil
+}
+The gob encoding is more Go-specific and might give you a size closer to the actual memory usage, but it still includes some encoding overhead.
+Remember, both these methods give you the size of a serialized representation of your data, which is different from the actual memory layout of the struct in Go. They're useful approximations but not exact measurements of in-memory size.
