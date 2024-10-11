@@ -1,0 +1,31 @@
+sequenceDiagram
+    participant M as Main
+    participant TR as TenantRouter
+    participant CH as ConsistentHash
+    participant DS as DatafeedStatus
+    participant WP as WorkerPool
+    participant CP as ContainerPool
+    participant DC as DockerContainer
+    participant CB as CircuitBreaker
+
+    M->>+TR: Route(data)
+    TR->>+CH: LocateKey(tenant+datafeedID)
+    CH-->>-TR: channelIndex
+    TR->>+DS: Check status
+    DS-->>-TR: status
+    alt circuit open
+        TR-->>M: Drop data
+    else circuit closed
+        TR->>+WP: Submit task
+        WP->>+CP: GetContainer()
+        CP-->>-WP: container
+        WP->>+DC: Process data
+        DC-->>-WP: result
+        WP->>+DS: Update status
+        DS->>+CB: Check/Update
+        CB-->>-DS: Updated status
+        DS-->>-WP: Status updated
+        WP->>CP: ReleaseContainer(container)
+        WP-->>-TR: Task completed
+    end
+    TR-->>-M: Data processed

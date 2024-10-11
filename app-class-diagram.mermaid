@@ -1,0 +1,53 @@
+classDiagram
+    class TenantRouter {
+        -channels []chan Data
+        -consistentHash *consistent.Consistent
+        -datafeedStatus map[string]*DatafeedStatus
+        -mu sync.RWMutex
+        -workerPools []*pond.WorkerPool
+        -containerPool *ContainerPool
+        +NewTenantRouter(numChannels int, workersPerChannel int, containerPoolSize int, imageName string) *TenantRouter
+        +Route(data Data)
+        +ReportFailure(datafeedID string)
+        -processData(data Data, workerID int)
+        -startWorkers(done chan bool)
+    }
+
+    class Data {
+        +Tenant string
+        +DatafeedID string
+        +Info string
+    }
+
+    class DatafeedStatus {
+        -circuitBreaker CircuitBreaker
+        -mu sync.Mutex
+    }
+
+    class CircuitBreaker {
+        -failures int
+        -threshold int
+        -lastFail time.Time
+        -cooldown time.Duration
+    }
+
+    class ContainerPool {
+        -containers chan *DockerContainer
+        -client *client.Client
+        +NewContainerPool(poolSize int, imageName string) *ContainerPool
+        -createContainer(imageName string) *DockerContainer
+        +GetContainer() *DockerContainer
+        +ReleaseContainer(container *DockerContainer)
+    }
+
+    class DockerContainer {
+        +ID string
+        +Stdin io.WriteCloser
+        +Stdout io.ReadCloser
+    }
+
+    TenantRouter "1" --> "*" DatafeedStatus
+    TenantRouter "1" --> "1" ContainerPool
+    TenantRouter ..> Data : routes
+    DatafeedStatus "1" --> "1" CircuitBreaker
+    ContainerPool "1" --> "*" DockerContainer
