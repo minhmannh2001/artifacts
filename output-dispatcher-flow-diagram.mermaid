@@ -1,0 +1,16 @@
+flowchart TD
+    A[Start] --> B[Initialize Dispatcher]
+    B --> C[Start Goroutine]
+    C --> D{Wait for Event}
+    D -->|Input Data| E[Add to Buffer]
+    E --> F{Buffer Full?}
+    F -->|Yes| G[Flush Buffer]
+    F -->|No| D
+    D -->|Timer Expired| H{Buffer Empty?}
+    H -->|No| G
+    H -->|Yes| I[Reset Timer]
+    I --> D
+    D -->|Stop Signal| J[Flush Remaining Data]
+    J --> K[Close Output Channel]
+    K --> L[End]
+    G --> I
