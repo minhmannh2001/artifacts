@@ -1,0 +1,32 @@
+sequenceDiagram
+    participant M as Main
+    participant DP as Dispatcher
+    participant WP as WorkerPool
+    participant W as Worker
+
+    M->>DP: Create Dispatcher
+    M->>WP: Create WorkerPool
+    M->>DP: Start()
+    M->>WP: Start()
+    activate DP
+    activate WP
+    loop For each worker
+        WP->>W: Start()
+        activate W
+    end
+    loop Until stopped
+        DP->>DP: Receive output
+        DP->>DP: Buffer output
+        alt Buffer full or timer expired
+            DP->>WP: Send buffered outputs
+            WP->>W: Assign job to available worker
+            W->>W: Process outputs
+        end
+    end
+    M->>DP: Stop()
+    M->>WP: Stop()
+    DP-->>DP: Flush remaining data
+    WP->>W: Stop all workers
+    deactivate W
+    deactivate WP
+    deactivate DP
