@@ -1,0 +1,14 @@
+flowchart TD
+    A[Start] --> B[Create container pool]
+    B --> C[Request container from pool]
+    C --> D{Container available?}
+    D -->|Yes| E[Retrieve tenant tokens from storage]
+    D -->|No| F[Wait for available container]
+    F --> C
+    E --> G[Set tenant tokens in container env]
+    G --> H[Start container]
+    H --> I[Use container for tenant tasks]
+    I --> J[Complete tasks]
+    J --> K[Remove tenant tokens from container env]
+    K --> L[Return container to pool]
+    L --> M[End]
