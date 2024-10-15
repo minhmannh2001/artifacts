@@ -1,0 +1,17 @@
+graph TD
+    A[Start] --> B[orenctl requests tasks from Zeebe]
+    B --> C[Zeebe returns tasks]
+    C --> D[orenctl enriches task information]
+    D --> E[orenctl stores tasks in buffer]
+    E --> F[orenctl worker requests tasks via gRPC]
+    F --> G[orenctl sends tasks to worker]
+    G --> H[Worker executes tasks]
+    H --> I[Worker sends output to orenctl]
+    I --> J{Retry successful?}
+    J -->|Yes| K[orenctl marks task as succeeded in Zeebe]
+    J -->|No| L{Max retries reached?}
+    L -->|No| I
+    L -->|Yes| M[Drop output]
+    M --> N[Wait for task timeout]
+    N --> B
+    K --> O[End]

@@ -1,0 +1,22 @@
+sequenceDiagram
+    participant Z as Zeebe
+    participant O as orenctl
+    participant W as orenctl worker
+
+    O->>Z: Get activated tasks (with timeout)
+    Z-->>O: Return tasks
+    O->>O: Enrich task information
+    O->>O: Store tasks in buffer
+    loop Periodic check
+        W->>O: gRPC request for tasks
+        O-->>W: Send tasks
+        W->>W: Execute tasks
+        W->>O: Send output (with retry)
+        alt Retry successful
+            O->>Z: Mark task as succeeded
+        else Max retries reached
+            W->>W: Drop output
+            Note over W,O: Task will be retrieved again after timeout
+        end
+    end
+    Note over Z,W: Process repeats for timed-out tasks
