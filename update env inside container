@@ -1,0 +1,186 @@
+I understand your requirement. You want to create a pool of Docker containers that can be dynamically assigned to different tenants by setting the appropriate tokens in the container's environment variables just before use. This approach allows for better resource utilization and flexibility. Let's modify the system to accommodate this new requirement.
+
+
+
+First, let's create a diagram to illustrate this new process:
+
+```mermaid
+flowchart TD
+    A[Start] --> B[Create container pool]
+    B --> C[Request container from pool]
+    C --> D{Container available?}
+    D -->|Yes| E[Retrieve tenant tokens from storage]
+    D -->|No| F[Wait for available container]
+    F --> C
+    E --> G[Set tenant tokens in container env]
+    G --> H[Start container]
+    H --> I[Use container for tenant tasks]
+    I --> J[Complete tasks]
+    J --> K[Remove tenant tokens from container env]
+    K --> L[Return container to pool]
+    L --> M[End]
+
+```
+
+Now, let's describe how you can implement this system:
+
+1. Token Storage:
+   Create a secure storage system for tenant tokens. This could be a database or a secure key-value store.
+
+   ```go
+   type TokenStore struct {
+       mu    sync.Mutex
+       tokens map[string]TenantTokens
+   }
+
+   type TenantTokens struct {
+       TenantToken          string
+       TenantDatafeedToken  string
+   }
+
+   func NewTokenStore() *TokenStore {
+       return &TokenStore{
+           tokens: make(map[string]TenantTokens),
+       }
+   }
+
+   func (ts *TokenStore) SetTokens(tenantID string, tokens TenantTokens) {
+       ts.mu.Lock()
+       defer ts.mu.Unlock()
+       ts.tokens[tenantID] = tokens
+   }
+
+   func (ts *TokenStore) GetTokens(tenantID string) (TenantTokens, bool) {
+       ts.mu.Lock()
+       defer ts.mu.Unlock()
+       tokens, exists := ts.tokens[tenantID]
+       return tokens, exists
+   }
+   ```
+
+2. Modify ContainerPool:
+   Update the ContainerPool to manage containers without tenant-specific information.
+
+   ```go
+   type ContainerPool struct {
+       mu         sync.Mutex
+       containers map[string]*Container
+       freePool   chan string
+       client     *client.Client
+       maxSize    int
+   }
+
+   type Container struct {
+       ID    string
+       State ContainerState
+   }
+   ```
+
+3. Update AddContainer function:
+   Modify the AddContainer function to create containers without tenant-specific information.
+
+   ```go
+   func (p *ContainerPool) AddContainer() error {
+       // ... (previous code for creating container)
+
+       // Remove tenant-specific token setting
+       // Instead, set a placeholder or leave it empty
+
+       // ... (rest of the container creation process)
+
+       p.containers[resp.ID] = &Container{ID: resp.ID, State: Free}
+       p.freePool <- resp.ID
+
+       return nil
+   }
+   ```
+
+4. Implement a function to assign a container to a tenant:
+
+   ```go
+   func (p *ContainerPool) AssignContainerToTenant(tenantID string, tokenStore *TokenStore) (*Container, error) {
+       p.mu.Lock()
+       defer p.mu.Unlock()
+
+       select {
+       case containerID := <-p.freePool:
+           container := p.containers[containerID]
+           tokens, exists := tokenStore.GetTokens(tenantID)
+           if !exists {
+               return nil, fmt.Errorf("no tokens found for tenant %s", tenantID)
+           }
+
+           // Set environment variables for the container
+           err := p.setContainerEnv(containerID, []string{
+               fmt.Sprintf("TENANT_TOKEN=%s", tokens.TenantToken),
+               fmt.Sprintf("TENANT_DATAFEED_TOKEN=%s", tokens.TenantDatafeedToken),
+           })
+           if err != nil {
+               return nil, fmt.Errorf("failed to set container environment: %v", err)
+           }
+
+           container.State = InUse
+           return container, nil
+
+       default:
+           return nil, fmt.Errorf("no free containers available")
+       }
+   }
+
+   func (p *ContainerPool) setContainerEnv(containerID string, env []string) error {
+       ctx := context.Background()
+       return p.client.ContainerUpdate(ctx, containerID, container.UpdateConfig{
+           Env: env,
+       })
+   }
+   ```
+
+5. Implement a function to release a container:
+
+   ```go
+   func (p *ContainerPool) ReleaseContainer(containerID string) error {
+       p.mu.Lock()
+       defer p.mu.Unlock()
+
+       container, exists := p.containers[containerID]
+       if !exists {
+           return fmt.Errorf("container %s not found in pool", containerID)
+       }
+
+       // Clear environment variables
+       err := p.setContainerEnv(containerID, []string{})
+       if err != nil {
+           return fmt.Errorf("failed to clear container environment: %v", err)
+       }
+
+       container.State = Free
+       p.freePool <- containerID
+
+       return nil
+   }
+   ```
+
+6. Usage in your main application:
+
+   ```go
+   tokenStore := NewTokenStore()
+   containerPool := NewContainerPool(/* ... */)
+
+   // When you need a container for a specific tenant:
+   container, err := containerPool.AssignContainerToTenant(tenantID, tokenStore)
+   if err != nil {
+       // Handle error
+   }
+
+   // Use the container for the tenant's tasks
+
+   // When done with the container:
+   err = containerPool.ReleaseContainer(container.ID)
+   if err != nil {
+       // Handle error
+   }
+   ```
+
+This approach allows you to maintain a pool of containers that can be dynamically assigned to different tenants. The tenant-specific tokens are stored separately and only set in the container's environment when it's assigned to a tenant. When the container is released, the environment is cleared, making it ready for use by another tenant.
+
+Remember to handle concurrent access properly and consider implementing additional features like automatic scaling of the container pool based on demand.
