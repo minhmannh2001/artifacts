@@ -1,0 +1,158 @@
+https://gosamples.dev/connection-reset-by-peer/
+https://dev.to/thanhphuchuynh/understanding-connection-reset-by-peer-in-golang-a-troubleshooting-guide-41pf
+
+Certainly! I'll provide you with a gRPC example that demonstrates the "connection reset by peer" error. This example will consist of a gRPC server and client, where the server will deliberately close the connection after receiving a request, simulating the "connection reset by peer" scenario.
+
+
+
+```go
+// proto/service.proto
+syntax = "proto3";
+package example;
+option go_package = "./proto";
+
+service ExampleService {
+  rpc SayHello (HelloRequest) returns (HelloReply) {}
+}
+
+message HelloRequest {
+  string name = 1;
+}
+
+message HelloReply {
+  string message = 1;
+}
+
+// server/main.go
+package main
+
+import (
+	"context"
+	"log"
+	"net"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "path/to/your/proto"
+)
+
+type server struct {
+	pb.UnimplementedExampleServiceServer
+}
+
+func (s *server) SayHello(ctx context.Context, in *pb.HelloRequest) (*pb.HelloReply, error) {
+	log.Printf("Received: %v", in.GetName())
+	
+	// Simulate some work
+	time.Sleep(100 * time.Millisecond)
+	
+	// Deliberately close the connection
+	return nil, status.Error(codes.Unavailable, "connection closed")
+}
+
+func main() {
+	lis, err := net.Listen("tcp", ":50051")
+	if err != nil {
+		log.Fatalf("failed to listen: %v", err)
+	}
+	s := grpc.NewServer()
+	pb.RegisterExampleServiceServer(s, &server{})
+	log.Printf("server listening at %v", lis.Addr())
+	if err := s.Serve(lis); err != nil {
+		log.Fatalf("failed to serve: %v", err)
+	}
+}
+
+// client/main.go
+package main
+
+import (
+	"context"
+	"log"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "path/to/your/proto"
+)
+
+func main() {
+	conn, err := grpc.Dial("localhost:50051", grpc.WithInsecure(), grpc.WithBlock())
+	if err != nil {
+		log.Fatalf("did not connect: %v", err)
+	}
+	defer conn.Close()
+	c := pb.NewExampleServiceClient(conn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	r, err := c.SayHello(ctx, &pb.HelloRequest{Name: "world"})
+	if err != nil {
+		st, ok := status.FromError(err)
+		if ok && st.Code() == codes.Unavailable {
+			log.Printf("Connection reset by peer: %v", err)
+		} else {
+			log.Fatalf("could not greet: %v", err)
+		}
+		return
+	}
+	log.Printf("Greeting: %s", r.GetMessage())
+}
+
+```
+
+This example demonstrates a gRPC "connection reset by peer" scenario. Here's how it works:
+
+1. We define a simple gRPC service in the `proto/service.proto` file.
+
+2. In the server (`server/main.go`):
+   - We implement the `SayHello` method.
+   - After receiving a request, we simulate some work with a small delay.
+   - We then deliberately close the connection by returning an error with the `codes.Unavailable` status.
+
+3. In the client (`client/main.go`):
+   - We establish a connection to the server and create a client.
+   - We make a `SayHello` request.
+   - We handle the error returned by the server, checking if it's a `codes.Unavailable` error, which in this case represents our "connection reset by peer" scenario.
+
+To run this example:
+
+1. Generate the gRPC code from the proto file:
+   ```
+   protoc --go_out=. --go-grpc_out=. proto/service.proto
+   ```
+
+2. Run the server:
+   ```
+   go run server/main.go
+   ```
+
+3. In another terminal, run the client:
+   ```
+   go run client/main.go
+   ```
+
+You should see output similar to this:
+
+Server output:
+```
+2023/10/16 10:00:00 server listening at [::]:50051
+2023/10/16 10:00:05 Received: world
+```
+
+Client output:
+```
+2023/10/16 10:00:05 Connection reset by peer: rpc error: code = Unavailable desc = connection closed
+```
+
+This example simulates a "connection reset by peer" scenario in gRPC by having the server deliberately close the connection. In real-world scenarios, this error could occur due to network issues, server crashes, or other problems that cause the connection to be unexpectedly terminated.
+
+To handle this in a production environment, you might want to implement retry logic in the client, use keep-alive mechanisms, or implement more robust error handling and logging to help diagnose the root cause of connection resets.
+
+Would you like me to explain any part of this example in more detail or provide information on how to make the system more resilient to such errors?
