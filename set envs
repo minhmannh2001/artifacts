@@ -1,0 +1,98 @@
+Certainly. I'll modify the code to allow getting data in the format `a=b,c=d,...` and set those key-value pairs as environment variables. Here's the updated version of the relevant part of the code:
+
+
+
+```python
+import os
+import json
+
+backup_env_vars = {}
+for key in os.environ.keys():
+    backup_env_vars[key] = os.environ[key]
+
+def set_env_vars_from_string(env_string):
+    if env_string:
+        pairs = env_string.split(',')
+        for pair in pairs:
+            key, value = pair.split('=')
+            os.environ[key.strip()] = value.strip()
+
+def rollback_system():
+    os.environ.clear()
+    os.environ.update(backup_env_vars)
+
+while True:
+    contextString = do_ping_pong()
+
+    code_string = ""
+    try:
+        contextJSON = json.loads(contextString)
+        if type(contextJSON) is not dict or "script" not in contextJSON:
+            break
+        code_string = contextJSON["script"]
+        contextJSON.pop("script", None)
+
+        # Set environment variables if provided
+        if "env_vars" in contextJSON:
+            set_env_vars_from_string(contextJSON["env_vars"])
+
+    except Exception as ex:
+        break
+
+    formatted = textwrap.indent(code_string, " " * 4)
+    complete_code = template_code.replace("###SCRIPT_HERE###", formatted)
+
+    try:
+        code = compile(complete_code, "<string>", "exec")
+
+        sub_globals = {
+            "__readALineFromStdin": __readALineFromStdin,
+            "context": contextJSON,
+        }
+
+        exec(code, sub_globals, sub_globals)
+
+    except (Exception, BaseException) as ex:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        if contextJSON["args"]["headers"].get("ignore_execution_exception", False):
+            element_id = contextJSON["args"]["__workflow_instance_task_elementId"]
+            outputConfig = contextJSON["args"]["script_output_config"]
+            send_script_continue_execution(
+                ex, exc_type, exc_value, exc_traceback, element_id, outputConfig
+            )
+        else:
+            send_script_exception(ex, exc_type, exc_value, exc_traceback)
+    except SystemExit:
+        pass
+
+    rollback_system()
+
+    send_script_completed()
+
+    if "native" in contextJSON:
+        is_python_native = contextJSON["native"]
+        if is_python_native:
+            break
+
+```
+
+Here are the key changes made to the code:
+
+1. I added a new function `set_env_vars_from_string(env_string)` that takes a string in the format `a=b,c=d,...` and sets the key-value pairs as environment variables.
+
+2. In the main loop, after parsing the `contextJSON`, I added a check for an "env_vars" key in the `contextJSON`. If it exists, the function `set_env_vars_from_string()` is called with the value of "env_vars".
+
+3. The `rollback_system()` function has been updated to clear all environment variables before restoring the backed-up ones. This ensures that any added environment variables during script execution are removed.
+
+These changes allow the script to accept environment variables in the specified format and set them before executing the script. The environment is then restored to its original state after the script execution is complete.
+
+To use this new functionality, you would need to include an "env_vars" key in the `contextJSON` with a string value in the format `a=b,c=d,...`. For example:
+
+```json
+{
+  "script": "your_script_here",
+  "env_vars": "API_KEY=1234,DEBUG=True,SERVER_URL=https://example.com"
+}
+```
+
+This will set the environment variables API_KEY, DEBUG, and SERVER_URL before executing the script, and then restore the original environment afterward.
