@@ -1,0 +1,62 @@
+package containerpool
+
+import (
+	"reflect"
+	"testing"
+)
+
+func Test_mergeFetchedData(t *testing.T) {
+	type args struct {
+		content         map[string]interface{}
+		newFetchedData  interface{}
+	}
+	tests := []struct {
+		name string
+		args args
+		want map[string]interface{}
+	}{
+		{
+			name: "Merge with existing fetched data (slice)",
+			args: args{
+				content: map[string]interface{}{
+					"fetched_data": []interface{}{"data1", "data2"},
+				},
+				newFetchedData: []interface{}{"data3", "data4"},
+			},
+			want: map[string]interface{}{
+				"fetched_data": []interface{}{"data1", "data2", "data3", "data4"},
+			},
+		},
+		{
+			name: "Merge with existing fetched data (map)",
+			args: args{
+				content: map[string]interface{}{
+					"fetched_data": map[string]interface{}{"key1": "value1", "key2": "value2"},
+				},
+				newFetchedData: map[string]interface{}{"key3": "value3", "key4": "value4"},
+			},
+			want: map[string]interface{}{
+				"fetched_data": map[string]interface{}{"key1": "value1", "key2": "value2", "key3": "value3", "key4": "value4"},
+			},
+		},
+		{
+			name: "No existing fetched data",
+			args: args{
+				content:        map[string]interface{}{},
+				newFetchedData: map[string]interface{}{"key1": "value1", "key2": "value2"},
+			},
+			want: map[string]interface{}{
+				"fetched_data": map[string]interface{}{"key1": "value1", "key2": "value2"},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &DockerContainer{}
+			c.mergeFetchedData(tt.args.content, tt.args.newFetchedData)
+			if !reflect.DeepEqual(tt.args.content, tt.want) {
+				t.Errorf("mergeFetchedData() = %v, want %v", tt.args.content, tt.want)
+			}
+		})
+	}
+}
