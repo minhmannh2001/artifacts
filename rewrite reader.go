@@ -30,7 +30,7 @@ func (ar *adaptiveReader) Read(p []byte) (int, error) {
 		return 0, nil
 	}
 
-	// Return buffered data first
+	// Return buffered data first if available
 	if len(ar.buffer) > 0 {
 		n := copy(p, ar.buffer)
 		ar.buffer = ar.buffer[n:]
@@ -41,20 +41,18 @@ func (ar *adaptiveReader) Read(p []byte) (int, error) {
 	if ar.checkMode {
 		header := make([]byte, headerSize)
 		n, err := io.ReadFull(ar.reader, header)
-		
-		// Handle EOF during initial read
-		if err == io.EOF {
+
+		// Handle EOF or partial data during initial read
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			if n == 0 {
 				return 0, io.EOF
 			}
 			ar.checkMode = false
-			return copy(p, header[:n]), nil
-		}
-
-		// Handle partial header
-		if err == io.ErrUnexpectedEOF {
-			ar.checkMode = false
-			return copy(p, header[:n]), nil
+			copied := copy(p, header[:n])
+			if copied < n {
+				ar.buffer = header[copied:n]
+			}
+			return copied, nil
 		}
 
 		// Handle other errors
@@ -62,7 +60,7 @@ func (ar *adaptiveReader) Read(p []byte) (int, error) {
 			return 0, err
 		}
 
-		// Check for valid Docker header
+		// We have a full header, check if it's Docker format
 		if (header[0] == StdoutStream || header[0] == StderrStream) && header[1] == 0 && header[2] == 0 && header[3] == 0 {
 			ar.isDocker = true
 			size := int(binary.BigEndian.Uint32(header[4:]))
@@ -80,23 +78,28 @@ func (ar *adaptiveReader) Read(p []byte) (int, error) {
 			return n, nil
 		}
 
-		// Not a Docker header, switch to regular mode and handle header as regular data
+		// Not a Docker header, treat as regular data
 		ar.checkMode = false
-		n = copy(p, header)
-		if n < len(header) {
-			ar.buffer = header[n:]
-			return n, nil
-		}
+        
+        // Copy header bytes first
+        n = copy(p, header)
+        if n < len(header) {
+            ar.buffer = header[n:]
+            return n, nil
+        }
 
-		// If we copied all header bytes and have room for more, continue reading
-		remaining := p[n:]
-		if len(remaining) > 0 {
-			m, err := ar.reader.Read(remaining)
-			return n + m, err
-		}
-		return n, nil
+        // If we have more space in p, try to read more data
+        if len(p) > n {
+            m, err := ar.reader.Read(p[n:])
+            if err != nil && err != io.EOF {
+                return n, err
+            }
+            return n + m, err
+        }
+        
+        return n, nil
 	}
 
-	// Regular read mode
+	// Regular read mode - just pass through to underlying reader
 	return ar.reader.Read(p)
 }
