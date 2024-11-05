@@ -1,0 +1,47 @@
+// First, create an index lifecycle policy
+PUT _ilm/policy/time_based_rollover_policy
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "actions": {
+          "rollover": {
+            "max_age": "5m"
+          }
+        }
+      },
+      "delete": {
+        "min_age": "0m",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}
+
+// Create an index template that applies to your indices
+PUT _template/time_based_template
+{
+  "index_patterns": ["my-index-*"],
+  "settings": {
+    "index": {
+      "lifecycle": {
+        "name": "time_based_rollover_policy",
+        "rollover_alias": "my-index"
+      },
+      "number_of_shards": 1,
+      "number_of_replicas": 1
+    }
+  }
+}
+
+// Create your initial index with the alias
+PUT my-index-000001
+{
+  "aliases": {
+    "my-index": {
+      "is_write_index": true
+    }
+  }
+}
