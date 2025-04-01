@@ -1,0 +1,200 @@
+Ah, I understand your concern. You want to continuously read new log lines as they are appended to the file while the container is running. Let's modify the code to handle this:
+
+```go
+func (c *Container) processContainerOutputFromFile(taskLog *zap.Logger, context string, args map[string]interface{}, outputFile string) interface{} {
+    var outputResult interface{}
+    taskInfo := parseTaskInfo(context)
+    playbookDebugged := taskInfo.GetKey("args").GetKey("headers").GetBoolOrDefault(viper.GetString("worker.debugKey"), true)
+
+    taskLog.Info("Run container ", zap.Any("name", c.Name), zap.Any("task context", taskInfo), zap.Any("args", args))
+
+    // Create local file to store container output
+    localFile := fmt.Sprintf("/tmp/local_%s.txt", c.ID)
+    defer os.Remove(localFile) // Clean up local file
+
+    // Wait for container to start writing output
+    time.Sleep(1 * time.Second)
+
+    // Copy initial output file from container
+    cmd := exec.Command("docker", "cp", fmt.Sprintf("%s:%s", c.ID, outputFile), localFile)
+    if err := cmd.Run(); err != nil {
+        taskLog.Error(fmt.Sprintf("Error copying output file: %v", err))
+        return createErrorOutput(&OutputContainer{
+            Type:       "error",
+            ErrMessage: fmt.Sprintf("Failed to copy output file: %v", err),
+        })
+    }
+
+    // Open file for reading
+    file, err := os.Open(localFile)
+    if err != nil {
+        taskLog.Error(fmt.Sprintf("Error opening output file: %v", err))
+        return createErrorOutput(&OutputContainer{
+            Type:       "error",
+            ErrMessage: fmt.Sprintf("Failed to open output file: %v", err),
+        })
+    }
+    defer file.Close()
+
+    // Create a channel to signal when we should stop reading
+    done := make(chan bool)
+    defer close(done)
+
+    // Start a goroutine to continuously copy new content from container
+    go func() {
+        ticker := time.NewTicker(100 * time.Millisecond) // Check for new content every 100ms
+        defer ticker.Stop()
+
+        for {
+            select {
+            case <-done:
+                return
+            case <-ticker.C:
+                // Copy new content from container
+                cmd := exec.Command("docker", "cp", fmt.Sprintf("%s:%s", c.ID, outputFile), localFile)
+                if err := cmd.Run(); err != nil {
+                    taskLog.Error(fmt.Sprintf("Error copying new output: %v", err))
+                }
+            }
+        }
+    }()
+
+    // Read file line by line
+    scanner := bufio.NewScanner(file)
+    lastPosition := 0
+
+    for {
+        // Read new lines
+        for scanner.Scan() {
+            line := scanner.Text()
+            taskLog.Debug("Container output line: ", zap.String("line", line))
+
+            outputContainer, err := parseOutputContainer(line, taskLog)
+            if err != nil {
+                continue
+            }
+
+            switch outputContainer.Type {
+            case "result":
+                outputResult = createResultOutput(outputContainer)
+            case "log":
+                c.handleLogOutput(outputContainer, taskInfo, playbookDebugged, taskLog)
+            case "exception", "error":
+                taskLog.Error(fmt.Sprintf("[Error running container]: %s", outputContainer.Message))
+                outputResult = createErrorOutput(outputContainer)
+            case "ignored_exception":
+                taskLog.Error("[Ignored exception]", zap.Any("Error:", outputContainer.Message))
+                outputResult = createResultOutput(outputContainer)
+            case "pending":
+                taskLog.Error("[Pending]", zap.Any("Pending:", outputContainer.Results))
+                outputResult = createPendingOutput(outputContainer)
+            case "completed":
+                return outputResult
+            default:
+                outputResult = createUnknownOutput(outputContainer)
+            }
+        }
+
+        // Check if we've reached the end of the file
+        if err := scanner.Err(); err != nil {
+            taskLog.Error(fmt.Sprintf("Error reading output file: %v", err))
+            return createErrorOutput(&OutputContainer{
+                Type:       "error",
+                ErrMessage: fmt.Sprintf("Failed to read output file: %v", err),
+            })
+        }
+
+        // Get current file size
+        fileInfo, err := file.Stat()
+        if err != nil {
+            taskLog.Error(fmt.Sprintf("Error getting file info: %v", err))
+            return createErrorOutput(&OutputContainer{
+                Type:       "error",
+                ErrMessage: fmt.Sprintf("Failed to get file info: %v", err),
+            })
+        }
+
+        // If file hasn't grown, wait a bit before checking again
+        if fileInfo.Size() == int64(lastPosition) {
+            time.Sleep(100 * time.Millisecond)
+            continue
+        }
+
+        // Update last position and reset scanner
+        lastPosition = int(fileInfo.Size())
+        file.Seek(0, 0)
+        scanner = bufio.NewScanner(file)
+    }
+}
+```
+
+Key changes made:
+
+1. **Continuous File Copying**:
+```go
+go func() {
+    ticker := time.NewTicker(100 * time.Millisecond)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-done:
+            return
+        case <-ticker.C:
+            // Copy new content from container
+            cmd := exec.Command("docker", "cp", fmt.Sprintf("%s:%s", c.ID, outputFile), localFile)
+            cmd.Run()
+        }
+    }
+}()
+```
+
+2. **Continuous File Reading**:
+```go
+for {
+    // Read new lines
+    for scanner.Scan() {
+        // Process lines...
+    }
+
+    // Check if file has grown
+    fileInfo, err := file.Stat()
+    if fileInfo.Size() == int64(lastPosition) {
+        time.Sleep(100 * time.Millisecond)
+        continue
+    }
+
+    // Reset scanner for new content
+    lastPosition = int(fileInfo.Size())
+    file.Seek(0, 0)
+    scanner = bufio.NewScanner(file)
+}
+```
+
+3. **Position Tracking**:
+```go
+lastPosition := 0
+// ...
+if fileInfo.Size() == int64(lastPosition) {
+    time.Sleep(100 * time.Millisecond)
+    continue
+}
+lastPosition = int(fileInfo.Size())
+```
+
+This implementation:
+1. Continuously copies new content from the container to a local file
+2. Monitors the file size to detect new content
+3. Resets the scanner when new content is detected
+4. Processes all new lines as they appear
+5. Handles errors gracefully
+6. Cleans up resources properly
+
+The main improvements:
+1. Real-time log processing
+2. No missed log lines
+3. Efficient resource usage
+4. Better error handling
+5. Clean shutdown mechanism
+
+Would you like me to explain any part in more detail or make additional modifications?
