@@ -1,0 +1,260 @@
+I'll help you modify the `process_tasks.go` file to use the new container pool implementation. Here's how we can update it:
+
+```go
+// process_tasks.go
+package worker
+
+import (
+    "encoding/json"
+    "fmt"
+    "orenctl/internal/app/helper/client"
+    "orenctl/internal/app/helper/logz"
+    pb "orenctl/internal/app/orenproto"
+    "orenctl/internal/app/orenworker/container"
+    "orenctl/internal/app/orenworker/logstream"
+    "orenctl/internal/app/orenworker/model"
+    "orenctl/internal/app/orenworker/monitor"
+    "orenctl/internal/app/orenworker/output"
+    "orenctl/internal/app/orenworker/repository"
+    "orenctl/internal/app/orenworker/singleton"
+    utils2 "orenctl/internal/app/orenworker/utils"
+    "strconv"
+    "strings"
+    "sync"
+    "time"
+
+    "github.com/spf13/viper"
+    "go.uber.org/zap"
+)
+
+var (
+    ContainerPools = make(map[string]*container.ContainerPool)
+    TotalInstances int
+    logger         = logz.GetDevLogger()
+    existingTenants = sync.Map{}
+    lock           = sync.RWMutex{}
+)
+
+const Server = "server"
+const Agent = "agent"
+
+type Context struct {
+    Script           string      `json:"script,omitempty"`
+    Command          string      `json:"command"`
+    IntegrationId    string      `json:"integrationid"`
+    Args             interface{} `json:"args"`
+    Params           interface{} `json:"params"`
+    WorkflowInstance interface{} `json:"workflowinstance"`
+    TaskID           string      `json:"taskID"`
+}
+
+func Init() {
+    ContainerPools = make(map[string]*container.ContainerPool)
+}
+
+func CreateContainerPool(tenant string, logStream *logstream.LogStream) {
+    TotalInstances = viper.GetInt("worker.numberOfInstances")
+    _, found := existingTenants.Load(tenant)
+    if !found {
+        // Create container pool for tenant
+        pool := container.NewContainerPool(TotalInstances, 10*time.Minute)
+        ContainerPools[tenant] = pool
+        existingTenants.Store(tenant, 1)
+    }
+}
+
+func countFreeInstance(tenant string) int32 {
+    pool, exists := ContainerPools[tenant]
+    if !exists {
+        return 0
+    }
+    return int32(pool.AvailableContainers())
+}
+
+func countAllFreeInstances() int32 {
+    if len(ContainerPools) == 0 {
+        return 1
+    }
+    var totalFree int32
+    for _, pool := range ContainerPools {
+        totalFree += int32(pool.AvailableContainers())
+    }
+    return totalFree
+}
+
+func findFreeContainer(image string, tenant string) (*container.Container, error) {
+    lock.Lock()
+    defer lock.Unlock()
+
+    pool, exists := ContainerPools[tenant]
+    if !exists {
+        return nil, fmt.Errorf("no container pool found for tenant %s", tenant)
+    }
+
+    // Try to get a container from the pool
+    container, err := pool.GetContainer()
+    if err != nil {
+        return nil, fmt.Errorf("failed to get container from pool: %v", err)
+    }
+
+    // Set container image and status
+    container.Image = image
+    container.SetStatus(2) // Running
+
+    return container, nil
+}
+
+func GetTasksWorker(
+    grpcClient client.IOrchestrationEngineClient,
+    logStreamer *logstream.LogStream,
+    workerChan chan struct{},
+    name string,
+    outputCh chan output.Output,
+    runningMode string,
+    repo repository.IProcessedJobRepo,
+) {
+    var taskChannels = map[string]chan *pb.Task{}
+    logger.Info("Start get tasks worker!")
+    tenantsChan := make(chan string, 1000)
+    numberOfWorkerPools := viper.GetInt32("worker.numberOfWorkerPools")
+    go HandleTasks(name, logStreamer, taskChannels, tenantsChan, outputCh, numberOfWorkerPools, repo)
+    if runningMode == Agent {
+        HandleAgentTask(workerChan, name, taskChannels, repo, tenantsChan)
+    } else {
+        InitStreamTask(grpcClient, name, taskChannels, tenantsChan)
+    }
+}
+
+// ... (keep other functions unchanged until ProcessTaskByTenant)
+
+func (p Processor) ProcessTaskByTenant(tenant string, task *pb.Task) {
+    if p.monitorClient != nil {
+        p.monitorClient.Client.Incr("numberOfTasks", 1)
+    }
+    taskLog := p.logger.With(zap.String("RequestID", task.RequestID), zap.String("task-id", task.Taskid))
+    taskLog.Debug("Start process task")
+    taskLog.Debug("Task content", zap.String("Task info", task.Integrationid))
+
+    // Parse task data
+    args := make(map[string]interface{})
+    params := make(map[string]interface{})
+    workflowInstance := make(map[string]interface{})
+
+    err := json.Unmarshal([]byte(task.Args), &args)
+    if err != nil {
+        <-p.lock
+        idemErr := p.processedJobRepo.Delete(utils2.JSONObject{"element_instance_key": p.GenIdempotentKey(task)})
+        taskLog.Error(fmt.Sprintf("Cannot parse args: %v", err), zap.Any("task.Args", task.Args), zap.Any("delete processed record", idemErr))
+        return
+    }
+
+    err = json.Unmarshal([]byte(task.Params), &params)
+    if err != nil {
+        <-p.lock
+        idemErr := p.processedJobRepo.Delete(utils2.JSONObject{"element_instance_key": p.GenIdempotentKey(task)})
+        taskLog.Error(fmt.Sprintf("Cannot parse params: %v", err), zap.Any("delete processed record", idemErr))
+        return
+    }
+
+    err = json.Unmarshal([]byte(task.WorkflowInstance), &workflowInstance)
+    if err != nil {
+        <-p.lock
+        idemErr := p.processedJobRepo.Delete(utils2.JSONObject{"element_instance_key": p.GenIdempotentKey(task)})
+        taskLog.Error(fmt.Sprintf("Cannot parse workflowInstance: %v", err), zap.Any("delete processed record", idemErr))
+        return
+    }
+
+    ctx := Context{
+        Script:           task.Script,
+        Command:          task.Command,
+        Args:             args,
+        Params:           params,
+        IntegrationId:    task.Integrationid,
+        WorkflowInstance: workflowInstance,
+        TaskID:           task.Taskid,
+    }
+
+    ctxBytes, _ := json.Marshal(ctx)
+    taskLog.Debug(fmt.Sprintf("context when running task %v", ctx.IntegrationId))
+
+    for {
+        container, err := findFreeContainer(task.Docker, task.Tenant)
+        if err == nil {
+            go func(task *pb.Task, container *container.Container, context string, args map[string]interface{}, taskLog *zap.Logger, repo repository.IProcessedJobRepo) {
+                taskLog.Debug("Start container to process task")
+                err = container.Run(p.name, context, args, task.RequestID, task.Taskid, p.outputCh)
+                taskLog.Debug(fmt.Sprintf("Done container %s", container.Name))
+                if err != nil {
+                    idemErr := repo.Delete(utils2.JSONObject{"element_instance_key": p.GenIdempotentKey(task)})
+                    taskLog.Debug(fmt.Sprintf("Run task failed: %v in container %s tenant %s", err, container.Name, task.Tenant), zap.Any("idemErr", idemErr))
+                }
+                // Return container to pool
+                pool := ContainerPools[task.Tenant]
+                pool.ReturnContainer(container)
+            }(task, container, string(ctxBytes), args, taskLog, p.processedJobRepo)
+            break
+        } else {
+            time.Sleep(300 * time.Millisecond)
+        }
+    }
+    <-p.lock
+}
+```
+
+Key changes made:
+
+1. **Container Pool Management**:
+```go
+var ContainerPools = make(map[string]*container.ContainerPool)
+```
+
+2. **Pool Creation**:
+```go
+func CreateContainerPool(tenant string, logStream *logstream.LogStream) {
+    TotalInstances = viper.GetInt("worker.numberOfInstances")
+    _, found := existingTenants.Load(tenant)
+    if !found {
+        pool := container.NewContainerPool(TotalInstances, 10*time.Minute)
+        ContainerPools[tenant] = pool
+        existingTenants.Store(tenant, 1)
+    }
+}
+```
+
+3. **Container Allocation**:
+```go
+func findFreeContainer(image string, tenant string) (*container.Container, error) {
+    pool, exists := ContainerPools[tenant]
+    if !exists {
+        return nil, fmt.Errorf("no container pool found for tenant %s", tenant)
+    }
+    container, err := pool.GetContainer()
+    // ...
+}
+```
+
+4. **Task Processing**:
+```go
+go func(task *pb.Task, container *container.Container, context string, args map[string]interface{}, taskLog *zap.Logger, repo repository.IProcessedJobRepo) {
+    // ... process task ...
+    // Return container to pool
+    pool := ContainerPools[task.Tenant]
+    pool.ReturnContainer(container)
+}(task, container, string(ctxBytes), args, taskLog, p.processedJobRepo)
+```
+
+Benefits of this approach:
+1. Better resource management
+2. Automatic container cleanup
+3. Improved performance
+4. Better error handling
+5. Cleaner code structure
+
+The main improvements:
+1. Container pooling per tenant
+2. Automatic container lifecycle management
+3. Better resource utilization
+4. Improved error handling
+5. Cleaner task processing flow
+
+Would you like me to explain any part in more detail or make additional modifications?
