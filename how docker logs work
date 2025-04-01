@@ -1,0 +1,160 @@
+Yes, you're correct! Docker container logs work exactly like that. Let me explain how Docker's logging system works:
+
+1. **Docker Log Driver**:
+```go
+// By default, Docker uses the "json-file" log driver which writes logs to files
+// The logs are stored in:
+// /var/lib/docker/containers/<container-id>/<container-id>-json.log
+
+// When you run a container, you can specify the log driver:
+cmd := exec.Command("docker", "run", 
+    "--log-driver=json-file",  // default driver
+    "--log-opt=max-size=2m",   // log file size limit
+    "--log-opt=max-file=2",    // number of log files to keep
+    "image")
+```
+
+2. **Log File Structure**:
+```go
+// The log file contains JSON entries:
+{
+    "log": "actual log message",
+    "stream": "stdout",  // or "stderr"
+    "time": "2024-03-31T12:00:00.000000000Z"
+}
+```
+
+3. **How Docker Reads Logs**:
+```go
+// When you run "docker logs", it reads from these files
+// Here's a simplified version of how it works:
+func readContainerLogs(containerID string) ([]string, error) {
+    logPath := fmt.Sprintf("/var/lib/docker/containers/%s/%s-json.log", 
+        containerID, containerID)
+    
+    file, err := os.Open(logPath)
+    if err != nil {
+        return nil, err
+    }
+    defer file.Close()
+
+    var logs []string
+    decoder := json.NewDecoder(file)
+    
+    for {
+        var entry struct {
+            Log    string `json:"log"`
+            Stream string `json:"stream"`
+            Time   string `json:"time"`
+        }
+        
+        if err := decoder.Decode(&entry); err != nil {
+            if err == io.EOF {
+                break
+            }
+            return nil, err
+        }
+        
+        logs = append(logs, entry.Log)
+    }
+    
+    return logs, nil
+}
+```
+
+4. **Log Rotation**:
+```go
+// Docker automatically rotates logs when they reach size limits
+// Configuration example:
+{
+    "log-driver": "json-file",
+    "log-opts": {
+        "max-size": "2m",
+        "max-file": "2"
+    }
+}
+```
+
+5. **Different Log Drivers**:
+```go
+// Docker supports multiple log drivers:
+// 1. json-file (default)
+// 2. journald
+// 3. syslog
+// 4. fluentd
+// 5. gelf
+// 6. awslogs
+// 7. splunk
+// 8. etwlogs
+// 9. gcplogs
+// 10. local
+```
+
+6. **Log Streaming**:
+```go
+// When you use "docker logs -f", it:
+// 1. Opens the log file
+// 2. Seeks to the end
+// 3. Continuously reads new entries
+// 4. Streams them to stdout
+
+func streamContainerLogs(containerID string) error {
+    logPath := fmt.Sprintf("/var/lib/docker/containers/%s/%s-json.log", 
+        containerID, containerID)
+    
+    file, err := os.Open(logPath)
+    if err != nil {
+        return err
+    }
+    defer file.Close()
+
+    // Seek to end of file
+    file.Seek(0, io.SeekEnd)
+
+    // Read new entries continuously
+    for {
+        var entry struct {
+            Log    string `json:"log"`
+            Stream string `json:"stream"`
+            Time   string `json:"time"`
+        }
+        
+        if err := json.NewDecoder(file).Decode(&entry); err != nil {
+            if err == io.EOF {
+                time.Sleep(100 * time.Millisecond)
+                continue
+            }
+            return err
+        }
+        
+        fmt.Print(entry.Log)
+    }
+}
+```
+
+7. **Log Buffer**:
+```go
+// Docker maintains a buffer in memory for recent logs
+// This is why you can see logs even if the container crashes
+// The buffer is flushed to disk periodically
+```
+
+So when you:
+1. Run a container
+2. Write to stdout/stderr
+3. Docker captures the output
+4. Writes it to JSON log files
+5. When you read logs, Docker reads from these files
+
+This is why:
+- Logs persist even after container stops
+- You can read logs from crashed containers
+- Log rotation prevents disk space issues
+- Log streaming is possible
+
+The file-based approach is actually Docker's default and recommended way of handling logs, as it provides:
+- Persistence
+- Reliability
+- Log rotation
+- Easy access
+- Multiple log driver options
