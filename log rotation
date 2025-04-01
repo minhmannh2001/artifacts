@@ -1,0 +1,156 @@
+To implement log rotation directly in your code without relying on external configurations, you can create a function that checks the size of the log file and rotates it when it exceeds a specified limit. Below is an example of how you can implement log rotation in your container's output handling logic.
+
+### Log Rotation Implementation
+
+1. **Define a Log Rotation Function**:
+   This function will check the size of the log file and rotate it if it exceeds a specified limit.
+
+```go
+package container
+
+import (
+    "os"
+    "path/filepath"
+)
+
+// RotateLogFile checks the size of the log file and rotates it if it exceeds the max size.
+func RotateLogFile(logFilePath string, maxSize int64) error {
+    fileInfo, err := os.Stat(logFilePath)
+    if err != nil {
+        return err
+    }
+
+    // Check if the file size exceeds the maximum size
+    if fileInfo.Size() >= maxSize {
+        // Create a new log file name with a timestamp
+        newLogFilePath := logFilePath + "." + time.Now().Format("20060102150405")
+
+        // Rename the current log file to the new log file
+        err = os.Rename(logFilePath, newLogFilePath)
+        if err != nil {
+            return err
+        }
+
+        // Create a new log file
+        _, err = os.Create(logFilePath)
+        if err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
+
+2. **Integrate Log Rotation into Your Output Processing**:
+   You can call the `RotateLogFile` function in your `processContainerOutputFromFile` method to ensure that the log file is rotated whenever new lines are read.
+
+```go
+func (c *Container) processContainerOutputFromFile(taskLog *zap.Logger, context string, args map[string]interface{}, outputDir string) interface{} {
+    var outputResult interface{}
+    taskInfo := parseTaskInfo(context)
+    playbookDebugged := taskInfo.GetKey("args").GetKey("headers").GetBoolOrDefault(viper.GetString("worker.debugKey"), true)
+
+    taskLog.Info("Run container ", zap.Any("name", c.Name), zap.Any("task context", taskInfo), zap.Any("args", args))
+
+    // Path to the mounted output file
+    outputFile := filepath.Join(outputDir, "output.txt")
+
+    // Open file for reading
+    file, err := os.Open(outputFile)
+    if err != nil {
+        taskLog.Error(fmt.Sprintf("Error opening output file: %v", err))
+        return createErrorOutput(&OutputContainer{
+            Type:       "error",
+            ErrMessage: fmt.Sprintf("Failed to open output file: %v", err),
+        })
+    }
+    defer file.Close()
+
+    // Create a channel to signal when we should stop reading
+    done := make(chan bool)
+    defer close(done)
+
+    // Read file line by line
+    scanner := bufio.NewScanner(file)
+    lastPosition := 0
+
+    for {
+        // Read new lines
+        for scanner.Scan() {
+            line := scanner.Text()
+            taskLog.Debug("Container output line: ", zap.String("line", line))
+
+            // Rotate log file if necessary
+            if err := RotateLogFile(outputFile, 10*1024*1024); err != nil { // Rotate if file exceeds 10MB
+                taskLog.Error(fmt.Sprintf("Error rotating log file: %v", err))
+            }
+
+            outputContainer, err := parseOutputContainer(line, taskLog)
+            if err != nil {
+                continue
+            }
+
+            switch outputContainer.Type {
+            case "result":
+                outputResult = createResultOutput(outputContainer)
+            case "log":
+                c.handleLogOutput(outputContainer, taskInfo, playbookDebugged, taskLog)
+            case "exception", "error":
+                taskLog.Error(fmt.Sprintf("[Error running container]: %s", outputContainer.Message))
+                outputResult = createErrorOutput(outputContainer)
+            case "ignored_exception":
+                taskLog.Error("[Ignored exception]", zap.Any("Error:", outputContainer.Message))
+                outputResult = createResultOutput(outputContainer)
+            case "pending":
+                taskLog.Error("[Pending]", zap.Any("Pending:", outputContainer.Results))
+                outputResult = createPendingOutput(outputContainer)
+            case "completed":
+                return outputResult
+            default:
+                outputResult = createUnknownOutput(outputContainer)
+            }
+        }
+
+        // Check if we've reached the end of the file
+        if err := scanner.Err(); err != nil {
+            taskLog.Error(fmt.Sprintf("Error reading output file: %v", err))
+            return createErrorOutput(&OutputContainer{
+                Type:       "error",
+                ErrMessage: fmt.Sprintf("Failed to read output file: %v", err),
+            })
+        }
+
+        // Get current file size
+        fileInfo, err := file.Stat()
+        if err != nil {
+            taskLog.Error(fmt.Sprintf("Error getting file info: %v", err))
+            return createErrorOutput(&OutputContainer{
+                Type:       "error",
+                ErrMessage: fmt.Sprintf("Failed to get file info: %v", err),
+            })
+        }
+
+        // If file hasn't grown, wait a bit before checking again
+        if fileInfo.Size() == int64(lastPosition) {
+            time.Sleep(100 * time.Millisecond)
+            continue
+        }
+
+        // Update last position and reset scanner
+        lastPosition = int(fileInfo.Size())
+        file.Seek(0, 0)
+        scanner = bufio.NewScanner(file)
+    }
+}
+```
+
+### Key Changes Made:
+1. **Log Rotation Function**: Added a function to check the log file size and rotate it if it exceeds a specified limit (e.g., 10MB).
+2. **Integration in Output Processing**: Called the log rotation function within the output processing loop to ensure that the log file is rotated as needed.
+
+### Benefits of This Approach:
+- **Automatic Log Management**: The log rotation is handled automatically within your application, without needing external configuration.
+- **Resource Efficiency**: Old logs are archived, preventing excessive disk usage.
+- **Simplicity**: The implementation is straightforward and easy to integrate into existing code.
+
+Would you like to see any additional features or modifications?
