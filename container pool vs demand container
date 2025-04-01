@@ -1,0 +1,200 @@
+Let me compare both approaches and their performance implications:
+
+1. **Container Pool Approach** (Keeping containers running):
+```go
+type ContainerPool struct {
+    containers chan *Container
+    maxSize    int
+}
+
+func (p *ContainerPool) Get() (*Container, error) {
+    select {
+    case container := <-p.containers:
+        return container, nil
+    default:
+        return p.createNewContainer()
+    }
+}
+
+// Performance characteristics:
+// Pros:
+// - Faster task execution (container already running)
+// - Lower container startup overhead
+// - Reuse of container resources
+// - Better for frequent tasks
+// Cons:
+// - Higher memory usage (containers always running)
+// - Resource waste when idle
+// - Need to manage container lifecycle
+```
+
+2. **On-Demand Approach** (Start/stop for each task):
+```go
+func runTask(command []string) error {
+    // Start container
+    cmd := exec.Command("docker", "run", "--rm", "image", command...)
+    if err := cmd.Run(); err != nil {
+        return err
+    }
+    // Container automatically stops and is removed
+    return nil
+}
+
+// Performance characteristics:
+// Pros:
+// - Lower memory usage when idle
+// - No resource waste
+// - Simpler management
+// - Better for infrequent tasks
+// Cons:
+// - Higher startup overhead
+// - Slower task execution
+// - More system calls
+```
+
+Performance Comparison:
+
+1. **Startup Time**:
+```go
+// Container Pool:
+startTime := time.Now()
+container := pool.Get() // ~10-50ms
+task.Execute(container) // Immediate
+
+// On-Demand:
+startTime := time.Now()
+cmd := exec.Command("docker", "run", "--rm", "image", command...) // ~200-500ms
+cmd.Run() // Additional container startup time
+```
+
+2. **Memory Usage**:
+```go
+// Container Pool:
+// Each running container uses:
+// - Container memory (~30-50MB)
+// - System resources
+// - Network resources
+// Total = containerCount * (containerMemory + overhead)
+
+// On-Demand:
+// Only uses memory during task execution
+// Memory is freed after task completion
+// Total = taskMemory + temporary overhead
+```
+
+3. **System Resources**:
+```go
+// Container Pool:
+// - Persistent network connections
+// - Persistent file handles
+// - Persistent process groups
+// - System call overhead for management
+
+// On-Demand:
+// - Temporary network connections
+// - Temporary file handles
+// - No persistent processes
+// - System call overhead for startup/teardown
+```
+
+4. **Task Execution Time**:
+```go
+// Container Pool:
+func (p *ContainerPool) ExecuteTask(task *Task) error {
+    container := p.Get()
+    // Immediate execution
+    return container.Execute(task)
+}
+
+// On-Demand:
+func ExecuteTask(task *Task) error {
+    // Container startup overhead
+    cmd := exec.Command("docker", "run", "--rm", "image", task.Command...)
+    // Additional overhead for container initialization
+    return cmd.Run()
+}
+```
+
+Recommendations:
+
+1. **Use Container Pool When**:
+```go
+// - Tasks are frequent (many per minute)
+// - Task execution time is short
+// - Low latency is required
+// - System has enough resources
+type ContainerPool struct {
+    containers chan *Container
+    maxSize    int
+    minSize    int
+}
+
+func (p *ContainerPool) Start() error {
+    // Start minimum number of containers
+    for i := 0; i < p.minSize; i++ {
+        container, err := p.createNewContainer()
+        if err != nil {
+            return err
+        }
+        p.containers <- container
+    }
+    return nil
+}
+```
+
+2. **Use On-Demand When**:
+```go
+// - Tasks are infrequent
+// - System resources are limited
+// - Task execution time is long
+// - Simplicity is preferred
+func ExecuteTaskOnDemand(task *Task) error {
+    cmd := exec.Command("docker", "run", "--rm",
+        "--memory=512m",  // Set resource limits
+        "--cpus=1",
+        "image",
+        task.Command...)
+    return cmd.Run()
+}
+```
+
+3. **Hybrid Approach**:
+```go
+type HybridContainerManager struct {
+    pool     *ContainerPool
+    maxIdle  time.Duration
+}
+
+func (h *HybridContainerManager) ExecuteTask(task *Task) error {
+    // Try to get container from pool
+    container, err := h.pool.Get()
+    if err == nil {
+        defer h.pool.Put(container)
+        return container.Execute(task)
+    }
+
+    // If pool is empty, create new container
+    return ExecuteTaskOnDemand(task)
+}
+
+func (h *HybridContainerManager) Cleanup() {
+    // Remove idle containers after maxIdle time
+    ticker := time.NewTicker(time.Minute)
+    for range ticker.C {
+        h.pool.RemoveIdleContainers(h.maxIdle)
+    }
+}
+```
+
+The choice between approaches depends on:
+1. Task frequency
+2. System resources
+3. Performance requirements
+4. Management complexity
+5. Cost considerations
+
+For best performance:
+- Use container pool for frequent, short tasks
+- Use on-demand for infrequent, long tasks
+- Consider hybrid approach for varying workloads
+- Monitor and adjust based on actual usage patterns
