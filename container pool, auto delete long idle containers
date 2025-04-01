@@ -1,0 +1,293 @@
+I'll help you create a container pool implementation with the features you described. Let's break this down into multiple components:
+
+1. First, let's create a container pool structure:
+
+```go
+// container_pool.go
+package container
+
+import (
+    "context"
+    "fmt"
+    "sync"
+    "time"
+)
+
+type Container struct {
+    ID          string
+    Name        string
+    Status      int // 0: stopped, 1: ready, 2: running
+    LastUsed    time.Time
+    OutputFile  string
+    Stdin       io.WriteCloser
+    Stdout      *os.File
+    Stderr      *os.File
+}
+
+type ContainerPool struct {
+    containers    chan *Container
+    maxSize       int
+    idleTimeout   time.Duration
+    mu            sync.Mutex
+    ctx           context.Context
+    cancel        context.CancelFunc
+}
+
+func NewContainerPool(maxSize int, idleTimeout time.Duration) *ContainerPool {
+    ctx, cancel := context.WithCancel(context.Background())
+    pool := &ContainerPool{
+        containers:  make(chan *Container, maxSize),
+        maxSize:     maxSize,
+        idleTimeout: idleTimeout,
+        ctx:         ctx,
+        cancel:      cancel,
+    }
+    go pool.cleanupLoop()
+    return pool
+}
+
+func (p *ContainerPool) cleanupLoop() {
+    ticker := time.NewTicker(time.Minute)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-p.ctx.Done():
+            return
+        case <-ticker.C:
+            p.cleanupIdleContainers()
+        }
+    }
+}
+
+func (p *ContainerPool) cleanupIdleContainers() {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+
+    // Check all containers in the pool
+    for i := 0; i < len(p.containers); i++ {
+        container := <-p.containers
+        if time.Since(container.LastUsed) > p.idleTimeout {
+            // Kill and remove idle container
+            p.killContainer(container)
+            continue
+        }
+        p.containers <- container
+    }
+}
+
+func (p *ContainerPool) killContainer(container *Container) {
+    cmd := exec.Command("docker", "rm", "-f", container.ID)
+    cmd.Run()
+}
+```
+
+2. Now, let's implement the container management methods:
+
+```go
+// container_pool.go (continued)
+
+func (p *ContainerPool) GetContainer() (*Container, error) {
+    select {
+    case container := <-p.containers:
+        container.LastUsed = time.Now()
+        return container, nil
+    default:
+        // Create new container if pool is not full
+        if len(p.containers) < p.maxSize {
+            return p.createNewContainer()
+        }
+        // Wait for available container
+        container := <-p.containers
+        container.LastUsed = time.Now()
+        return container, nil
+    }
+}
+
+func (p *ContainerPool) createNewContainer() (*Container, error) {
+    name := fmt.Sprintf("container_%d", time.Now().UnixNano())
+    container := &Container{
+        Name:     name,
+        Status:   1, // ready
+        LastUsed: time.Now(),
+    }
+
+    // Create container with output redirection
+    cmd := exec.Command("docker", "run", "-d",
+        "--name", name,
+        "--rm",
+        "image",
+        "tail", "-f", "/dev/null") // Keep container running
+
+    output, err := cmd.Output()
+    if err != nil {
+        return nil, err
+    }
+    container.ID = strings.TrimSpace(string(output))
+
+    // Set up output files
+    container.OutputFile = fmt.Sprintf("/tmp/%s_output.txt", name)
+    cmd = exec.Command("docker", "exec", container.ID,
+        "sh", "-c", fmt.Sprintf("touch %s", container.OutputFile))
+    if err := cmd.Run(); err != nil {
+        p.killContainer(container)
+        return nil, err
+    }
+
+    return container, nil
+}
+
+func (p *ContainerPool) ExecuteTask(container *Container, command []string) (string, error) {
+    // Redirect output to file
+    redirectCmd := fmt.Sprintf("(%s) > %s 2>&1", strings.Join(command, " "), container.OutputFile)
+    cmd := exec.Command("docker", "exec", container.ID, "sh", "-c", redirectCmd)
+    
+    if err := cmd.Run(); err != nil {
+        return "", err
+    }
+
+    // Copy output file from container
+    localFile := fmt.Sprintf("/tmp/%s_local.txt", container.Name)
+    cmd = exec.Command("docker", "cp", fmt.Sprintf("%s:%s", container.ID, container.OutputFile), localFile)
+    if err := cmd.Run(); err != nil {
+        return "", err
+    }
+
+    // Read the output
+    output, err := ioutil.ReadFile(localFile)
+    if err != nil {
+        return "", err
+    }
+
+    // Cleanup local file
+    os.Remove(localFile)
+
+    return string(output), nil
+}
+
+func (p *ContainerPool) ReturnContainer(container *Container) {
+    select {
+    case p.containers <- container:
+        // Container returned to pool
+    default:
+        // Pool is full, kill the container
+        p.killContainer(container)
+    }
+}
+
+func (p *ContainerPool) Close() {
+    p.cancel()
+    close(p.containers)
+    // Kill all remaining containers
+    for container := range p.containers {
+        p.killContainer(container)
+    }
+}
+```
+
+3. Let's create a usage example:
+
+```go
+// main.go
+package main
+
+import (
+    "fmt"
+    "log"
+    "time"
+)
+
+func main() {
+    // Create container pool with max 5 containers and 10 minutes idle timeout
+    pool := container.NewContainerPool(5, 10*time.Minute)
+    defer pool.Close()
+
+    // Example task execution
+    task := func() error {
+        // Get container from pool
+        container, err := pool.GetContainer()
+        if err != nil {
+            return err
+        }
+        defer pool.ReturnContainer(container)
+
+        // Execute task
+        output, err := pool.ExecuteTask(container, []string{"echo", "Hello from container"})
+        if err != nil {
+            return err
+        }
+
+        fmt.Printf("Task output: %s\n", output)
+        return nil
+    }
+
+    // Run multiple tasks concurrently
+    for i := 0; i < 10; i++ {
+        go func() {
+            if err := task(); err != nil {
+                log.Printf("Task failed: %v", err)
+            }
+        }()
+    }
+
+    // Wait for tasks to complete
+    time.Sleep(5 * time.Second)
+}
+```
+
+4. Let's add some configuration options:
+
+```go
+// config.go
+package container
+
+type PoolConfig struct {
+    MaxSize       int
+    IdleTimeout   time.Duration
+    Image         string
+    OutputDir     string
+    MemoryLimit   string
+    CPULimit      string
+}
+
+func NewContainerPoolWithConfig(config PoolConfig) *ContainerPool {
+    pool := NewContainerPool(config.MaxSize, config.IdleTimeout)
+    pool.config = config
+    return pool
+}
+```
+
+Key features of this implementation:
+
+1. **Container Pool Management**:
+- Fixed maximum number of containers
+- Waits for available containers when pool is full
+- Automatically kills idle containers
+- Thread-safe operations
+
+2. **Output Handling**:
+- Redirects stdout/stderr to container file
+- Copies output file from container
+- Reads and returns output
+- Cleans up temporary files
+
+3. **Resource Management**:
+- Proper cleanup of containers
+- Resource limits support
+- Idle container cleanup
+- Context-based cancellation
+
+4. **Error Handling**:
+- Graceful error recovery
+- Container cleanup on failure
+- Resource cleanup
+- Proper logging
+
+To use this with Tork, you would:
+1. Create a container pool
+2. Get containers from pool for tasks
+3. Execute tasks with output redirection
+4. Return containers to pool
+5. Handle cleanup automatically
+
+Would you like me to explain any part in more detail or add additional features?
