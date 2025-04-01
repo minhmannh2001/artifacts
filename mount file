@@ -1,0 +1,183 @@
+Yes, we can mount the container's output file directly to the host system using Docker's volume mounting. This will be more efficient than copying files. Here's the modified code:
+
+```go
+func (c *Container) Run(name string, context string, args map[string]interface{}, requestID string, taskID string, outputCh chan output.Output) error {
+    taskLog := logz.With(zap.String("RequestID", requestID), zap.String("task-id", taskID))
+
+    if c.Status != 0 {
+        if err := c.recreateAndInitializeContainer(context, taskLog); err != nil {
+            return err
+        }
+
+        // Create output directory on host
+        outputDir := fmt.Sprintf("/tmp/container_outputs/%s", c.ID)
+        if err := os.MkdirAll(outputDir, 0755); err != nil {
+            return fmt.Errorf("failed to create output directory: %v", err)
+        }
+        defer os.RemoveAll(outputDir) // Clean up output directory
+
+        // Create output file path in container
+        containerOutputFile := "/tmp/output.txt"
+        
+        // Modify container command to mount output directory
+        c.Cmd.Args = append(c.Cmd.Args, 
+            "--volume", fmt.Sprintf("%s:/tmp/outputs", outputDir),
+            "--env", fmt.Sprintf("OUTPUT_FILE=%s", containerOutputFile))
+
+        // Redirect command output to mounted file
+        if _, err := c.Stdin.Write([]byte(fmt.Sprintf("%s > %s 2>&1\n", context, containerOutputFile))); err != nil {
+            taskLog.Warn(fmt.Sprintf("Error writing command to container: %v", err))
+            _ = c.StopContainer()
+            return err
+        }
+
+        // Process the output from the mounted file
+        outputResult := c.processContainerOutputFromFile(taskLog, context, args, outputDir)
+
+        // Send output through the channel
+        c.sendOutput(name, taskID, requestID, args, outputResult, taskLog, outputCh)
+
+        // Log final result
+        c.logFinalResult(context, outputResult, taskLog)
+    }
+
+    // Ready
+    c.Status = 1
+    c.ChangeTime = time.Now().Unix()
+
+    return nil
+}
+
+func (c *Container) processContainerOutputFromFile(taskLog *zap.Logger, context string, args map[string]interface{}, outputDir string) interface{} {
+    var outputResult interface{}
+    taskInfo := parseTaskInfo(context)
+    playbookDebugged := taskInfo.GetKey("args").GetKey("headers").GetBoolOrDefault(viper.GetString("worker.debugKey"), true)
+
+    taskLog.Info("Run container ", zap.Any("name", c.Name), zap.Any("task context", taskInfo), zap.Any("args", args))
+
+    // Path to the mounted output file
+    outputFile := filepath.Join(outputDir, "output.txt")
+
+    // Open file for reading
+    file, err := os.Open(outputFile)
+    if err != nil {
+        taskLog.Error(fmt.Sprintf("Error opening output file: %v", err))
+        return createErrorOutput(&OutputContainer{
+            Type:       "error",
+            ErrMessage: fmt.Sprintf("Failed to open output file: %v", err),
+        })
+    }
+    defer file.Close()
+
+    // Create a channel to signal when we should stop reading
+    done := make(chan bool)
+    defer close(done)
+
+    // Read file line by line
+    scanner := bufio.NewScanner(file)
+    lastPosition := 0
+
+    for {
+        // Read new lines
+        for scanner.Scan() {
+            line := scanner.Text()
+            taskLog.Debug("Container output line: ", zap.String("line", line))
+
+            outputContainer, err := parseOutputContainer(line, taskLog)
+            if err != nil {
+                continue
+            }
+
+            switch outputContainer.Type {
+            case "result":
+                outputResult = createResultOutput(outputContainer)
+            case "log":
+                c.handleLogOutput(outputContainer, taskInfo, playbookDebugged, taskLog)
+            case "exception", "error":
+                taskLog.Error(fmt.Sprintf("[Error running container]: %s", outputContainer.Message))
+                outputResult = createErrorOutput(outputContainer)
+            case "ignored_exception":
+                taskLog.Error("[Ignored exception]", zap.Any("Error:", outputContainer.Message))
+                outputResult = createResultOutput(outputContainer)
+            case "pending":
+                taskLog.Error("[Pending]", zap.Any("Pending:", outputContainer.Results))
+                outputResult = createPendingOutput(outputContainer)
+            case "completed":
+                return outputResult
+            default:
+                outputResult = createUnknownOutput(outputContainer)
+            }
+        }
+
+        // Check if we've reached the end of the file
+        if err := scanner.Err(); err != nil {
+            taskLog.Error(fmt.Sprintf("Error reading output file: %v", err))
+            return createErrorOutput(&OutputContainer{
+                Type:       "error",
+                ErrMessage: fmt.Sprintf("Failed to read output file: %v", err),
+            })
+        }
+
+        // Get current file size
+        fileInfo, err := file.Stat()
+        if err != nil {
+            taskLog.Error(fmt.Sprintf("Error getting file info: %v", err))
+            return createErrorOutput(&OutputContainer{
+                Type:       "error",
+                ErrMessage: fmt.Sprintf("Failed to get file info: %v", err),
+            })
+        }
+
+        // If file hasn't grown, wait a bit before checking again
+        if fileInfo.Size() == int64(lastPosition) {
+            time.Sleep(100 * time.Millisecond)
+            continue
+        }
+
+        // Update last position and reset scanner
+        lastPosition = int(fileInfo.Size())
+        file.Seek(0, 0)
+        scanner = bufio.NewScanner(file)
+    }
+}
+```
+
+Key changes made:
+
+1. **Volume Mounting**:
+```go
+outputDir := fmt.Sprintf("/tmp/container_outputs/%s", c.ID)
+c.Cmd.Args = append(c.Cmd.Args, 
+    "--volume", fmt.Sprintf("%s:/tmp/outputs", outputDir),
+    "--env", fmt.Sprintf("OUTPUT_FILE=%s", containerOutputFile))
+```
+
+2. **Direct File Access**:
+```go
+outputFile := filepath.Join(outputDir, "output.txt")
+file, err := os.Open(outputFile)
+```
+
+3. **Directory Management**:
+```go
+if err := os.MkdirAll(outputDir, 0755); err != nil {
+    return fmt.Errorf("failed to create output directory: %v", err)
+}
+defer os.RemoveAll(outputDir) // Clean up output directory
+```
+
+Benefits of this approach:
+1. More efficient - no need to copy files
+2. Real-time access to container output
+3. Lower resource usage
+4. Better performance
+5. Simpler implementation
+
+The main improvements:
+1. Direct file access through volume mounting
+2. No file copying overhead
+3. Immediate access to new log lines
+4. Better resource management
+5. Cleaner code structure
+
+Would you like me to explain any part in more detail or make additional modifications?
