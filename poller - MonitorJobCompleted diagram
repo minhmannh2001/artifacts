@@ -1,0 +1,29 @@
+flowchart TD
+    A[Start MonitorJobCompleted] --> B[Setup panic recovery]
+    B --> C[Initialize Kafka repo]
+    C --> D[Subscribe to job_state topic]
+    D --> E[Enter infinite loop]
+    
+    E --> F[Read Kafka message]
+    F --> G{Read error?}
+    G -->|Yes| E
+    G -->|No| H[Spawn goroutine]
+    
+    H --> I[Unmarshal message to KafkaMessage]
+    I --> J[Extract jobInfo & payloadResult]
+    
+    J --> K{Job terminated or ignored?}
+    K -->|Yes| L[Log debug & return]
+    
+    K -->|No| M{Check job type}
+    
+    M -->|UpdateStatusOnly| N[Update job status only]
+    M -->|FetchData with data| O[Handle fetch data job]
+    M -->|Other| P[Mark as completed & update job]
+    
+    N --> Q[Continue loop]
+    O --> Q
+    P --> Q
+    Q --> E
+    
+    L --> Q
