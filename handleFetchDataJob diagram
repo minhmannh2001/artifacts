@@ -1,0 +1,28 @@
+flowchart TD
+    A[Start handleFetchDataJob] --> B{Check RunningMode}
+    B -->|INGESTING| C[Process Alert Classification]
+    B -->|Other| J[Skip Classification]
+    
+    C --> D[Get Classification Info]
+    D --> E[Process Each Alert]
+    
+    E --> F[Apply Mapping Normalize]
+    F --> G[Get Alert Type]
+    G --> H[Process Entity Extraction]
+    H --> I[Add to ProcessedData]
+    
+    I --> J[Mark Output as Ignored]
+    J --> K[Create New Job Record]
+    
+    K --> L{Is INGESTING mode?}
+    L -->|Yes| M[Push to SOAR via Ingestor]
+    L -->|No| N[Skip Ingestion]
+    
+    M -->|Success| O[Update Job Status COMPLETED]
+    M -->|Error| P[Update Job Status TERMINATED]
+    
+    N --> O
+    
+    O --> Q[Send Kafka Message]
+    P --> Q
+    Q --> R[End]
