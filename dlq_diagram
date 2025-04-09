@@ -1,0 +1,57 @@
+sequenceDiagram
+    participant Job Worker
+    participant Ingestor
+    participant Kafka DLQ
+    participant DLQ Consumer
+    participant SOAR API
+
+    Job Worker->>Ingestor: InsertAlertBulk(alerts, tenant)
+    
+    alt Successful Insertion
+        Ingestor->>SOAR API: POST /alert/entity_extraction
+        SOAR API-->>Ingestor: 200/201 OK
+        Ingestor-->>Job Worker: Success
+    else Failed Insertion
+        Ingestor->>SOAR API: POST /alert/entity_extraction
+        SOAR API-->>Ingestor: Error (400/500)
+        Ingestor-->>Job Worker: Error
+        
+        Job Worker->>Kafka DLQ: Send Failed Alert
+        Note over Kafka DLQ: Store with metadata:<br/>- Alert data<br/>- Error info<br/>- Retry count<br/>- Timestamp<br/>- Job ID
+        
+        loop Retry Process
+            DLQ Consumer->>Kafka DLQ: Poll Messages
+            
+            alt Max Retries Exceeded
+                DLQ Consumer->>DLQ Consumer: Log Permanent Failure
+            else Within Retry Limit
+                DLQ Consumer->>DLQ Consumer: Wait (Exponential Backoff)
+                DLQ Consumer->>Ingestor: Retry InsertAlertBulk
+                
+                alt Retry Successful
+                    Ingestor->>SOAR API: POST /alert/entity_extraction
+                    SOAR API-->>Ingestor: 200/201 OK
+                    Ingestor-->>DLQ Consumer: Success
+                else Retry Failed
+                    Ingestor->>SOAR API: POST /alert/entity_extraction
+                    SOAR API-->>Ingestor: Error
+                    Ingestor-->>DLQ Consumer: Error
+                    DLQ Consumer->>Kafka DLQ: Requeue with increased retry count
+                end
+            end
+        end
+    end
+
+This diagram shows:
+Initial alert insertion flow
+Error handling path when insertion fails
+DLQ message structure with metadata
+Retry process with exponential backoff
+Success and failure paths during retry
+Maximum retry limit handling
+The flow demonstrates how failed alerts are:
+Captured and stored in Kafka DLQ
+Processed by a dedicated DLQ consumer
+Retried with increasing delays
+Either successfully processed or permanently failed after max retries
+Would you like me to explain any specific part of the flow in more detail?
