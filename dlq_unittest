@@ -1,0 +1,24 @@
+These tests cover:
+DLQ Consumer:
+Consumer initialization
+Retry logic
+Message processing
+Context cancellation
+Success and failure scenarios
+DLQ Sending Mechanism:
+Sending alerts to DLQ
+Error handling
+Job status updates
+Integration flow
+Edge Cases:
+Kafka errors
+Invalid messages
+Maximum retries
+Backoff timing
+Key testing aspects:
+Mocked dependencies (Kafka, Ingestor)
+Various error scenarios
+Timeout handling
+Message validation
+Retry count verification
+Full integration flow
