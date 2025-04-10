@@ -1,0 +1,61 @@
+flowchart TD
+    A[Start create_alerts_batch] --> B{Validate Input}
+    
+    B -->|Invalid| C[Raise InvalidParameter Error]
+    B -->|Valid| D[Initialize Response List]
+    
+    D --> E[Loop Through Alert Batch]
+    
+    E --> F{Process Single Alert}
+    
+    F --> G[Set Default Fields]
+    G --> H[Validate Severity]
+    
+    H -->|Invalid| I[Raise InvalidParameter Error]
+    H -->|Valid| J[Reduce Alert Size]
+    
+    J --> K[Create Alert Record]
+    
+    K --> L{Has Entities?}
+    L -->|No| N{Has Events?}
+    L -->|Yes| M[Process Entities]
+    
+    M --> M1[Check Existing Entities]
+    M1 --> M2[Create New Entities if Needed]
+    M2 --> M3[Create Entity-Alert Mapping]
+    M3 --> N
+    
+    N -->|Yes| O[Process Events]
+    N -->|No| P[Add to Response List]
+    
+    O --> O1[Generate Event ID]
+    O1 --> O2[Create Event Record]
+    O2 --> P
+    
+    P --> Q{More Alerts?}
+    Q -->|Yes| E
+    Q -->|No| R[Return Response]
+    
+    K -->|Error| S[Rollback Transaction]
+    M -->|Error| S
+    O -->|Error| S
+    
+    S --> T[Raise InternalServerError]
+    
+    subgraph "Error Handling"
+        S
+        T
+    end
+    
+    subgraph "Entity Processing"
+        M
+        M1
+        M2
+        M3
+    end
+    
+    subgraph "Event Processing"
+        O
+        O1
+        O2
+    end
