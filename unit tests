@@ -1,0 +1,228 @@
+import unittest
+from unittest.mock import patch, MagicMock
+from datetime import datetime
+import uuid
+from flask import Flask
+from soar_api.rest.alerts import create_alerts_batch
+from soar_api.common import api_error
+from soar_api.models.alert import Alert
+
+class TestAlertsBatch(unittest.TestCase):
+    def setUp(self):
+        self.app = Flask(__name__)
+        self.app_context = self.app.app_context()
+        self.app_context.push()
+        self.app.config['MAX_ALERT_SIZE'] = 2
+        self.app.config['TRIM_FRACTION_OF_ALERT_SIZE'] = 0.1
+
+        # Mock time for consistent testing
+        self.current_time = 1677649200000  # Example timestamp
+        self.time_patcher = patch('soar_api.rest.alerts.get_time')
+        self.mock_time = self.time_patcher.start()
+        self.mock_time.return_value = self.current_time
+
+    def tearDown(self):
+        self.time_patcher.stop()
+        self.app_context.pop()
+
+    def test_create_alerts_batch_invalid_input(self):
+        """Test handling of invalid input format"""
+        with self.assertRaises(api_error.InvalidParameter) as context:
+            create_alerts_batch(body={})  # Should be list, not dict
+        self.assertEqual(context.exception.error_code, 4001000)
+
+    def test_create_alerts_batch_missing_tenant(self):
+        """Test handling of missing tenant"""
+        body = [{"alert": {"severity": "HIGH"}}]  # Missing tenant
+        with self.assertRaises(api_error.InvalidParameter) as context:
+            create_alerts_batch(body=body)
+        self.assertEqual(context.exception.error_code, 4001000)
+
+    def test_create_alerts_batch_invalid_severity(self):
+        """Test handling of invalid severity"""
+        body = [{
+            "tenant": "tenant1",
+            "alert": {"severity": "INVALID"}
+        }]
+        with self.assertRaises(api_error.InvalidParameter) as context:
+            create_alerts_batch(body=body)
+        self.assertEqual(context.exception.error_code, 4001000)
+
+    @patch('soar_api.rest.alerts.records_store')
+    @patch('soar_api.rest.alerts.ActorAPI')
+    def test_create_alerts_batch_basic_alert(self, mock_actor_api, mock_records_store):
+        """Test creation of basic alert without entities or events"""
+        mock_actor_api.return_value.get_actor.return_value = "test_user"
+        mock_records_store.create.return_value = {"alert_id": "test_alert_1"}
+
+        body = [{
+            "tenant": "tenant1",
+            "alert": {
+                "severity": "HIGH",
+                "message": "Test alert"
+            }
+        }]
+
+        response, status_code = create_alerts_batch(body=body)
+        
+        self.assertEqual(status_code, 201)
+        self.assertTrue("data" in response.json)
+        created_alert = response.json["data"][0]
+        self.assertEqual(created_alert["tenant"], "tenant1")
+        self.assertEqual(created_alert["alert"]["alert_id"], "test_alert_1")
+
+    @patch('soar_api.rest.alerts.records_store')
+    @patch('soar_api.rest.alerts.records')
+    @patch('soar_api.rest.alerts.ActorAPI')
+    def test_create_alerts_batch_with_entities(self, mock_actor_api, mock_records, mock_records_store):
+        """Test creation of alert with entities"""
+        mock_actor_api.return_value.get_actor.return_value = "test_user"
+        mock_records_store.create.side_effect = [
+            {"alert_id": "test_alert_1"},  # Alert creation
+            {"_id": "entity_1"},           # Entity creation
+            {"_id": "mapping_1"}           # Entity-alert mapping creation
+        ]
+
+        # Mock database session for entity checking
+        mock_session = MagicMock()
+        mock_session.query().filter().filter().all.return_value = []
+        mock_records.get_db.return_value.session = mock_session
+
+        body = [{
+            "tenant": "tenant1",
+            "alert": {
+                "severity": "HIGH",
+                "message": "Test alert"
+            },
+            "entity": [{
+                "entity_type_key": "ip_address",
+                "value": "192.168.1.1",
+                "entity_type_name": "IP Address"
+            }]
+        }]
+
+        response, status_code = create_alerts_batch(body=body)
+        
+        self.assertEqual(status_code, 201)
+        self.assertEqual(mock_records_store.create.call_count, 3)  # Alert + Entity + Mapping
+
+    @patch('soar_api.rest.alerts.records_store')
+    @patch('soar_api.rest.alerts.uuid.uuid4')
+    def test_create_alerts_batch_with_events(self, mock_uuid4, mock_records_store):
+        """Test creation of alert with events"""
+        mock_uuid4.return_value = "test-uuid"
+        mock_records_store.create.side_effect = [
+            {"alert_id": "test_alert_1"},  # Alert creation
+            {"_id": "event_1"}             # Event creation
+        ]
+
+        body = [{
+            "tenant": "tenant1",
+            "alert": {
+                "severity": "HIGH",
+                "message": "Test alert"
+            },
+            "events": [{
+                "event_id": "orig_event_1",
+                "data": {"source": "firewall", "action": "block"}
+            }]
+        }]
+
+        response, status_code = create_alerts_batch(body=body)
+        
+        self.assertEqual(status_code, 201)
+        # Verify event creation
+        event_create_call = mock_records_store.create.call_args_list[1]
+        self.assertEqual(event_create_call[1]['table'], 'alert_artifact_event')
+        self.assertEqual(event_create_call[1]['data']['_alert_id'], 'test_alert_1')
+
+    @patch('soar_api.rest.alerts.records_store')
+    def test_create_alerts_batch_database_error(self, mock_records_store):
+        """Test handling of database errors"""
+        mock_records_store.create.side_effect = Exception("Database error")
+
+        body = [{
+            "tenant": "tenant1",
+            "alert": {
+                "severity": "HIGH",
+                "message": "Test alert"
+            }
+        }]
+
+        with self.assertRaises(api_error.InternalServerError):
+            create_alerts_batch(body=body)
+        
+        # Verify rollback was called
+        mock_records_store.rollback.assert_called_once()
+
+    @patch('soar_api.rest.alerts.records_store')
+    @patch('soar_api.rest.alerts.records')
+    @patch('soar_api.rest.alerts.ActorAPI')
+    def test_create_alerts_batch_multiple_alerts(self, mock_actor_api, mock_records, mock_records_store):
+        """Test creation of multiple alerts in single batch"""
+        mock_actor_api.return_value.get_actor.return_value = "test_user"
+        mock_records_store.create.side_effect = [
+            {"alert_id": "test_alert_1"},
+            {"alert_id": "test_alert_2"}
+        ]
+
+        body = [
+            {
+                "tenant": "tenant1",
+                "alert": {
+                    "severity": "HIGH",
+                    "message": "Test alert 1"
+                }
+            },
+            {
+                "tenant": "tenant2",
+                "alert": {
+                    "severity": "MEDIUM",
+                    "message": "Test alert 2"
+                }
+            }
+        ]
+
+        response, status_code = create_alerts_batch(body=body)
+        
+        self.assertEqual(status_code, 201)
+        self.assertEqual(len(response.json["data"]), 2)
+        self.assertEqual(response.json["data"][0]["alert"]["alert_id"], "test_alert_1")
+        self.assertEqual(response.json["data"][1]["alert"]["alert_id"], "test_alert_2")
+
+    @patch('soar_api.rest.alerts.records_store')
+    @patch('soar_api.rest.alerts.records')
+    def test_create_alerts_batch_with_existing_entity(self, mock_records, mock_records_store):
+        """Test creation of alert with existing entity"""
+        mock_records_store.create.side_effect = [
+            {"alert_id": "test_alert_1"},  # Alert creation
+            {"_id": "mapping_1"}           # Entity-alert mapping creation
+        ]
+
+        # Mock existing entity in database
+        mock_session = MagicMock()
+        mock_session.query().filter().filter().all.return_value = [
+            (1, "ip_address", "192.168.1.1")  # Existing entity
+        ]
+        mock_records.get_db.return_value.session = mock_session
+
+        body = [{
+            "tenant": "tenant1",
+            "alert": {
+                "severity": "HIGH",
+                "message": "Test alert"
+            },
+            "entity": [{
+                "entity_type_key": "ip_address",
+                "value": "192.168.1.1"
+            }]
+        }]
+
+        response, status_code = create_alerts_batch(body=body)
+        
+        self.assertEqual(status_code, 201)
+        # Verify that entity wasn't created again
+        self.assertEqual(mock_records_store.create.call_count, 2)  # Only alert and mapping
+
+if __name__ == '__main__':
+    unittest.main()
