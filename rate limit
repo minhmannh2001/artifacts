@@ -1,0 +1,158 @@
+package apis
+
+import (
+    "bytes"
+    "context"
+    "datafeedctl/internal/app/logz"
+    "encoding/json"
+    "fmt"
+    "io/ioutil"
+    "net/http"
+    "sync"
+    "time"
+
+    "golang.org/x/time/rate"
+)
+
+type SoarAPIClient struct {
+    baseURL       string
+    apiKey        string
+    alerts        []interface{}
+    maxRetries    int
+    retryInterval int // in seconds
+    rateLimiter   *rate.Limiter
+}
+
+const (
+    insertAlertBatchEndpoint = "/v1/alert/batch"
+    defaultRateLimit        = 10  // requests per second
+    defaultBurst           = 20  // burst capacity
+)
+
+// singleton rate limiter instance shared across all client instances
+var (
+    globalRateLimiter *rate.Limiter
+    limiterOnce      sync.Once
+)
+
+func getGlobalRateLimiter() *rate.Limiter {
+    limiterOnce.Do(func() {
+        globalRateLimiter = rate.NewLimiter(rate.Limit(defaultRateLimit), defaultBurst)
+    })
+    return globalRateLimiter
+}
+
+func NewSoarAPIClient(baseURL, apiKey string, alerts []interface{}, maxRetries, retryInterval int) *SoarAPIClient {
+    return &SoarAPIClient{
+        baseURL:       baseURL,
+        apiKey:        apiKey,
+        alerts:        alerts,
+        maxRetries:    maxRetries,
+        retryInterval: retryInterval,
+        rateLimiter:   getGlobalRateLimiter(),
+    }
+}
+
+// ... [SoarAPIResponse struct and const definitions remain the same]
+
+func (i *SoarAPIClient) SendAlerts() error {
+    if err := i.sendBatchWithRetry(i.alerts); err != nil {
+        return fmt.Errorf("failed to ingest alerts batch: %v", err)
+    }
+    return nil
+}
+
+func (s *SoarAPIClient) sendBatchWithRetry(batchAlerts []interface{}) error {
+    alertsJSON, err := json.Marshal(map[string]interface{}{
+        "alerts": batchAlerts,
+    })
+    if err != nil {
+        return fmt.Errorf("failed to marshal alerts batch: %w", err)
+    }
+
+    for attempt := 1; attempt <= s.maxRetries; attempt++ {
+        // Wait for rate limiter before making the request
+        ctx := context.Background()
+        err := s.rateLimiter.Wait(ctx)
+        if err != nil {
+            logz.Error(fmt.Sprintf("Rate limiter wait failed: %v", err))
+            return fmt.Errorf("rate limiter error: %w", err)
+        }
+
+        resp, err := s.sendRequestToSoarAPI(alertsJSON)
+        if err != nil {
+            logz.Error(fmt.Sprintf("SOAR batch request attempt %d failed: %v", attempt, err))
+            if attempt == s.maxRetries {
+                return fmt.Errorf("failed after %d attempts: %w", s.maxRetries, err)
+            }
+            time.Sleep(time.Duration(s.retryInterval) * time.Second)
+            continue
+        }
+
+        // Handle rate limiting response from server
+        if resp.Status == http.StatusTooManyRequests {
+            retryAfter := time.Second * time.Duration(s.retryInterval) // default retry interval
+            if retryAfterHeader := resp.Instance; retryAfterHeader != "" {
+                if parsedTime, err := time.ParseDuration(retryAfterHeader + "s"); err == nil {
+                    retryAfter = parsedTime
+                }
+            }
+            logz.Info(fmt.Sprintf("Rate limited by server, waiting %v before retry", retryAfter))
+            time.Sleep(retryAfter)
+            continue
+        }
+
+        if s.isSuccessfulResponse(resp) {
+            return nil
+        }
+
+        if resp.Status == http.StatusBadRequest {
+            return fmt.Errorf("batch request failed: error_code=%d, detail=%s", resp.ErrorCode, resp.Detail)
+        }
+
+        if resp.Status == http.StatusInternalServerError {
+            if attempt == s.maxRetries {
+                return fmt.Errorf("SOAR API server error persisted after %d attempts", s.maxRetries)
+            }
+            time.Sleep(time.Duration(s.retryInterval) * time.Second)
+            continue
+        }
+
+        return fmt.Errorf("unexpected SOAR API response: %s", resp.Detail)
+    }
+
+    return nil
+}
+
+// ... [rest of the code remains the same]
+
+
+Key changes and improvements:
+Added rate limiting using golang.org/x/time/rate package
+Implemented a global rate limiter using singleton pattern to ensure rate limiting across all client instances
+Added constants for default rate limit (10 requests/second) and burst capacity (20)
+Added handling for HTTP 429 (Too Many Requests) response
+Added proper context handling for rate limiter
+Added rate limiter configuration through constants (can be made configurable through config file)
+To make the rate limit configurable, you can add these to your configuration file:
+
+[soar_api]
+base_url="http://10.255.250.109:8084"
+api_key="your-api-key"
+rate_limit=10  # requests per second
+burst_limit=20 # burst capacity
+
+func getGlobalRateLimiter() *rate.Limiter {
+    limiterOnce.Do(func() {
+        rateLimit := viper.GetFloat64("soar_api.rate_limit")
+        burstLimit := viper.GetInt("soar_api.burst_limit")
+        if rateLimit == 0 {
+            rateLimit = defaultRateLimit
+        }
+        if burstLimit == 0 {
+            burstLimit = defaultBurst
+        }
+        globalRateLimiter = rate.NewLimiter(rate.Limit(rateLimit), burstLimit)
+    })
+    return globalRateLimiter
+}
