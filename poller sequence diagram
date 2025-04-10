@@ -1,0 +1,45 @@
+sequenceDiagram
+    participant P as Poller
+    participant AM as AlertMonitor
+    participant KR as KafkaRepository
+    participant SA as SoarAPIClient
+    participant K as Kafka
+    participant S as SOAR API
+    participant DLQ as Dead Letter Queue
+
+    Note over P: Start
+    P->>P: launch()
+    P->>P: configure()
+    P->>AM: NewAlertMonitor(kafkaRepo)
+    
+    loop MonitorFetchedAlerts
+        AM->>KR: ReadMessageBatch()
+        KR->>K: Fetch Messages
+        K-->>KR: Return Messages
+        KR-->>AM: Return Messages
+        
+        AM->>AM: convertMessagesToAlerts()
+        
+        alt Valid Alerts
+            AM->>SA: SendAlerts()
+            SA->>S: Send Batch with Rate Limit
+            
+            alt Success
+                S-->>SA: 200/201 OK
+                SA-->>AM: Success
+                AM->>KR: Commit Messages
+                
+            else API Error
+                S-->>SA: Error (4xx/5xx)
+                SA-->>AM: Error
+                AM->>DLQ: sendToDLQ()
+            end
+            
+        else Invalid Messages
+            AM->>DLQ: sendToDLQ()
+        end
+    end
+
+    Note over P: Handle Shutdown
+    P->>AM: Stop()
+    P->>P: Stop()
