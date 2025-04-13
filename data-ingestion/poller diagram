@@ -1,0 +1,39 @@
+flowchart TD
+    Start([Start Poller]) --> Config[Load Configuration]
+    
+    subgraph Poller Main Flow
+        Config --> KR[Initialize Kafka Repository]
+        KR --> AM[Create Alert Monitor]
+        AM --> |Start Goroutine| MFA[Monitor Fetched Alerts]
+        AM --> |Register| SH[Setup Signal Handler]
+    end
+
+    subgraph Alert Monitor Flow
+        MFA --> |Subscribe| KT[Kafka Topic]
+        KT --> Loop{Continuous Loop}
+        
+        Loop --> |Read Batch| RM[Read Messages]
+        RM --> |Process| CA[Convert to Alerts]
+        CA --> |Forward| SA[Send to SOAR API]
+        
+        SA --> |Success| CM[Commit Messages]
+        SA --> |Failure| DLQ[Send to DLQ Topic]
+        
+        CM --> Loop
+        DLQ --> Loop
+    end
+
+    subgraph Signal Handling
+        SH --> |SIGTERM/SIGINT| GE[Graceful Exit]
+        GE --> |Stop| SAM[Stop Alert Monitor]
+        GE --> |Stop| SP[Stop Poller]
+    end
+
+    style Start fill:#90EE90
+    style GE fill:#FFB6C1
+
+    classDef kafka fill:#f9f,stroke:#333,stroke-width:2px
+    class KT,DLQ kafka
+
+    classDef process fill:#bbf,stroke:#333,stroke-width:2px
+    class RM,CA,SA,CM process
