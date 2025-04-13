@@ -1,0 +1,249 @@
+package helpers
+
+import (
+    "testing"
+
+    "github.com/stretchr/testify/assert"
+)
+
+func TestExtractEntities(t *testing.T) {
+    tests := []struct {
+        name                 string
+        alert               map[string]interface{}
+        alertType           string
+        entityExtractionInfo []models.EntityExtraction
+        expectedResults     []map[string]interface{}
+    }{
+        {
+            name: "Valid alert type name",
+            alert: map[string]interface{}{
+                "source": "test-source",
+                "data":   "test-data",
+            },
+            alertType: "malware",
+            entityExtractionInfo: []models.EntityExtraction{
+                {
+                    AlertType: map[string]interface{}{
+                        "name": "malware",
+                    },
+                    Fields: []string{"source", "data"},
+                },
+            },
+            expectedResults: []map[string]interface{}{
+                {
+                    "source": "test-source",
+                    "data":   "test-data",
+                },
+            },
+        },
+        {
+            name: "Missing alert type name",
+            alert: map[string]interface{}{
+                "source": "test-source",
+            },
+            alertType: "malware",
+            entityExtractionInfo: []models.EntityExtraction{
+                {
+                    AlertType: map[string]interface{}{},
+                    Fields:    []string{"source"},
+                },
+            },
+            expectedResults: []map[string]interface{}{},
+        },
+        {
+            name: "Nil alert type",
+            alert: map[string]interface{}{
+                "source": "test-source",
+            },
+            alertType: "malware",
+            entityExtractionInfo: []models.EntityExtraction{
+                {
+                    AlertType: map[string]interface{}{
+                        "name": nil,
+                    },
+                    Fields: []string{"source"},
+                },
+            },
+            expectedResults: []map[string]interface{}{},
+        },
+        {
+            name: "Non-string alert type",
+            alert: map[string]interface{}{
+                "source": "test-source",
+            },
+            alertType: "malware",
+            entityExtractionInfo: []models.EntityExtraction{
+                {
+                    AlertType: map[string]interface{}{
+                        "name": 123, // Invalid type
+                    },
+                    Fields: []string{"source"},
+                },
+            },
+            expectedResults: []map[string]interface{}{},
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            processor := NewAlertProcessor()
+            results := processor.ExtractEntities(tt.alert, tt.alertType, tt.entityExtractionInfo)
+            assert.Equal(t, tt.expectedResults, results)
+        })
+    }
+}
+
+func TestIsMatchingAlertType(t *testing.T) {
+    tests := []struct {
+        name        string
+        extractType interface{}
+        alertType   string
+        expected    bool
+    }{
+        {
+            name:        "Matching string types",
+            extractType: "malware",
+            alertType:   "MALWARE",
+            expected:    true,
+        },
+        {
+            name:        "Non-matching string types",
+            extractType: "malware",
+            alertType:   "phishing",
+            expected:    false,
+        },
+        {
+            name:        "Nil extract type",
+            extractType: nil,
+            alertType:   "malware",
+            expected:    false,
+        },
+        {
+            name:        "Non-string extract type",
+            extractType: 123,
+            alertType:   "malware",
+            expected:    false,
+        },
+        {
+            name:        "Empty strings",
+            extractType: "",
+            alertType:   "",
+            expected:    true,
+        },
+        {
+            name:        "Mixed case matching",
+            extractType: "Malware",
+            alertType:   "malWARE",
+            expected:    true,
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            processor := NewAlertProcessor()
+            result := processor.isMatchingAlertType(tt.extractType, tt.alertType)
+            assert.Equal(t, tt.expected, result)
+        })
+    }
+}
+
+func TestMappingNormalize(t *testing.T) {
+    tests := []struct {
+        name            string
+        alert          map[string]interface{}
+        transformations []models.NormalizeTransformation
+        returnError    bool
+        expected       map[string]interface{}
+    }{
+        {
+            name: "Basic normalization",
+            alert: map[string]interface{}{
+                "source": "test-source",
+                "type":   "test-type",
+            },
+            transformations: []models.NormalizeTransformation{
+                {
+                    SourceField: "source",
+                    TargetField: "normalized_source",
+                },
+            },
+            returnError: false,
+            expected: map[string]interface{}{
+                "source":            "test-source",
+                "type":              "test-type",
+                "normalized_source": "test-source",
+            },
+        },
+        // Add more test cases as needed
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            result := MappingNormalize(tt.alert, tt.transformations, tt.returnError)
+            assert.Equal(t, tt.expected, result)
+        })
+    }
+}
+
+func TestGetMappingEntityExtraction(t *testing.T) {
+    tests := []struct {
+        name                 string
+        alert               map[string]interface{}
+        alertType           string
+        entityExtractionInfo []models.EntityExtraction
+        expected            []map[string]interface{}
+    }{
+        {
+            name: "Basic entity extraction",
+            alert: map[string]interface{}{
+                "source": "test-source",
+                "data":   "test-data",
+            },
+            alertType: "malware",
+            entityExtractionInfo: []models.EntityExtraction{
+                {
+                    AlertType: map[string]interface{}{
+                        "name": "malware",
+                    },
+                    Fields: []string{"source", "data"},
+                },
+            },
+            expected: []map[string]interface{}{
+                {
+                    "source": "test-source",
+                    "data":   "test-data",
+                },
+            },
+        },
+        // Add more test cases as needed
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            result := GetMappingEntityExtraction(tt.alert, tt.alertType, tt.entityExtractionInfo)
+            assert.Equal(t, tt.expected, result)
+        })
+    }
+}
+
+This test file includes:
+TestExtractEntities: Tests the updated ExtractEntities method with various scenarios including:
+Valid alert type name
+Missing alert type name
+Nil alert type
+Non-string alert type
+TestIsMatchingAlertType: Tests the updated isMatchingAlertType method with scenarios including:
+Matching string types
+Non-matching string types
+Nil extract type
+Non-string extract type
+Empty strings
+Mixed case matching
+TestMappingNormalize: Tests the helper function that uses AlertProcessor for normalization
+TestGetMappingEntityExtraction: Tests the helper function that uses AlertProcessor for entity extraction
+The tests cover:
+Happy path scenarios
+Edge cases
+Error cases
+Type safety checks
+Case sensitivity handling
