@@ -1,0 +1,42 @@
+flowchart TD
+    Start([Start]) --> InputAlert[/Input Alert Data/]
+    
+    subgraph AlertProcessor
+        InputAlert --> Normalize{Normalization}
+        
+        subgraph Normalization Process
+            Normalize --> |For each transformation| GetField[Get Field Value]
+            GetField --> TransformValue[Transform Value]
+            TransformValue --> UpdateField[Update Field]
+            UpdateField --> CheckMore{More transformations?}
+            CheckMore --> |Yes| GetField
+            CheckMore --> |No| Classification
+        end
+        
+        subgraph Classification Process
+            Classification{Classification} --> GetClassField[Get Classification Field]
+            GetClassField --> MatchType[Match Alert Type]
+            MatchType --> |Match Found| SetType[Set Alert Type]
+            MatchType --> |No Match| SetUnclassified[Set as Unclassified]
+        end
+        
+        subgraph Entity Extraction Process
+            SetType --> Extract{Entity Extraction}
+            SetUnclassified --> Extract
+            Extract --> |For each entity| GetEntity[Get Entity Field]
+            GetEntity --> TransformEntity[Transform Entity Value]
+            TransformEntity --> CreateEntity[Create Entity Object]
+            CreateEntity --> CheckEntities{More entities?}
+            CheckEntities --> |Yes| GetEntity
+            CheckEntities --> |No| FinalizeAlert
+        end
+    end
+    
+    FinalizeAlert[/Processed Alert/] --> End([End])
+    
+    style Start fill:#90EE90
+    style End fill:#FFB6C1
+    style AlertProcessor fill:#f0f0f0
+    style Normalization Process fill:#e6f3ff
+    style Classification Process fill:#fff0e6
+    style Entity Extraction Process fill:#e6ffe6
