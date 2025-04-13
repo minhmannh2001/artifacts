@@ -1,0 +1,41 @@
+sequenceDiagram
+    participant Client
+    participant Poller
+    participant AlertMonitor
+    participant Kafka
+    participant SOAR_API
+    participant DLQ
+
+    Note over Poller: System Startup
+    Client->>Poller: Start Service
+    activate Poller
+    Poller->>Poller: Load Configuration
+    Poller->>AlertMonitor: Create Monitor
+    activate AlertMonitor
+    
+    par Signal Handler
+        Poller->>Poller: Setup Signal Handler
+    and Alert Monitoring
+        AlertMonitor->>Kafka: Subscribe to Topic
+        
+        loop Message Processing
+            Kafka-->>AlertMonitor: Read Message Batch
+            AlertMonitor->>AlertMonitor: Convert Messages to Alerts
+            
+            alt Successful Processing
+                AlertMonitor->>SOAR_API: Forward Alerts
+                SOAR_API-->>AlertMonitor: Success Response
+                AlertMonitor->>Kafka: Commit Messages
+            else Processing Failed
+                SOAR_API-->>AlertMonitor: Error Response
+                AlertMonitor->>DLQ: Send Failed Messages
+            end
+        end
+    end
+
+    Note over Poller: Shutdown Sequence
+    Client->>Poller: SIGTERM/SIGINT
+    Poller->>AlertMonitor: Stop Monitor
+    deactivate AlertMonitor
+    Poller->>Poller: Cleanup Resources
+    deactivate Poller
