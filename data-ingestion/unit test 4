@@ -1,0 +1,191 @@
+func TestConvertMessagesToAlerts(t *testing.T) {
+    tests := []struct {
+        name           string
+        messages       []*kafka.Message
+        expectedAlerts int
+        runningMode    string
+    }{
+        {
+            name: "Valid messages with INGESTING mode",
+            messages: []*kafka.Message{
+                {
+                    Value: []byte(`{
+                        "data": {
+                            "alert": {"id": "1", "severity": "high"},
+                            "tenant": "test"
+                        },
+                        "running_mode": "INGESTING"
+                    }`),
+                },
+            },
+            expectedAlerts: 1,
+            runningMode:    "INGESTING",
+        },
+        {
+            name: "Valid messages with non-INGESTING mode",
+            messages: []*kafka.Message{
+                {
+                    Value: []byte(`{
+                        "data": {
+                            "alert": {"id": "1", "severity": "high"},
+                            "tenant": "test"
+                        },
+                        "running_mode": "OTHER"
+                    }`),
+                },
+            },
+            expectedAlerts: 1,
+            runningMode:    "OTHER",
+        },
+        {
+            name: "Invalid JSON message",
+            messages: []*kafka.Message{
+                {Value: []byte(`invalid json`)},
+            },
+            expectedAlerts: 0,
+        },
+        {
+            name:           "Empty message list",
+            messages:       []*kafka.Message{},
+            expectedAlerts: 0,
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            monitor := NewAlertMonitor(new(MockKafkaRepository))
+            
+            // Mock preprocessData if needed
+            if tt.runningMode == "INGESTING" {
+                patches := gomonkey.ApplyMethod(reflect.TypeOf(monitor), "preprocessData",
+                    func(_ *AlertMonitor, _ *helpers.AlertWithEvents, _ *helpers.ResultMessage) {})
+                defer patches.Reset()
+            }
+
+            alerts := monitor.convertMessagesToAlerts(tt.messages)
+            assert.Equal(t, tt.expectedAlerts, len(alerts))
+        })
+    }
+}
+
+func TestPreprocessData(t *testing.T) {
+    tests := []struct {
+        name          string
+        alert        *helpers.AlertWithEvents
+        result       *helpers.ResultMessage
+        expectPreprocess bool
+    }{
+        {
+            name: "Valid alert data",
+            alert: &helpers.AlertWithEvents{
+                Alert: map[string]interface{}{
+                    "id": "1",
+                    "severity": "high",
+                },
+            },
+            result: &helpers.ResultMessage{
+                MappingNormalize: []models.NormalizeTransformation{},
+                AlertClassificationInfo: helpers.AlertClassificationInfo{},
+                EntityExtractionInfo: []models.EntityExtraction{},
+            },
+            expectPreprocess: true,
+        },
+        {
+            name: "Invalid alert data type",
+            alert: &helpers.AlertWithEvents{
+                Alert: "not a map",
+            },
+            result: &helpers.ResultMessage{},
+            expectPreprocess: false,
+        },
+        {
+            name: "Nil alert data",
+            alert: &helpers.AlertWithEvents{
+                Alert: nil,
+            },
+            result: &helpers.ResultMessage{},
+            expectPreprocess: false,
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            monitor := NewAlertMonitor(new(MockKafkaRepository))
+            
+            preprocessCalled := false
+            patches := gomonkey.ApplyMethod(reflect.TypeOf(monitor), "preprocessAlert",
+                func(_ *AlertMonitor, _ map[string]interface{}, _ *helpers.ResultMessage) {
+                    preprocessCalled = true
+                })
+            defer patches.Reset()
+
+            monitor.preprocessData(tt.alert, tt.result)
+            assert.Equal(t, tt.expectPreprocess, preprocessCalled)
+        })
+    }
+}
+
+func TestPreprocessAlert(t *testing.T) {
+    tests := []struct {
+        name      string
+        alertData map[string]interface{}
+        result    *helpers.ResultMessage
+        setup     func(*helpers.AlertProcessor)
+    }{
+        {
+            name: "Full preprocessing pipeline",
+            alertData: map[string]interface{}{
+                "id": "1",
+                "severity": "high",
+            },
+            result: &helpers.ResultMessage{
+                MappingNormalize: []models.NormalizeTransformation{
+                    {FieldFrom: "severity", FieldTo: "normalized_severity"},
+                },
+                AlertClassificationInfo: helpers.AlertClassificationInfo{
+                    FieldName: "severity",
+                    MappingType: []models.MappingAlertType{},
+                },
+                EntityExtractionInfo: []models.EntityExtraction{},
+            },
+            setup: func(processor *helpers.AlertProcessor) {
+                patches := gomonkey.NewPatches()
+                patches.ApplyMethod(reflect.TypeOf(processor), "ProcessNormalization",
+                    func(_ *helpers.AlertProcessor, alert map[string]interface{}, _ []models.NormalizeTransformation, _ bool) map[string]interface{} {
+                        return alert
+                    })
+                patches.ApplyMethod(reflect.TypeOf(processor), "ClassifyAlert",
+                    func(_ *helpers.AlertProcessor, _ string, _ map[string]interface{}, _ []models.MappingAlertType) string {
+                        return "classified_type"
+                    })
+                patches.ApplyMethod(reflect.TypeOf(processor), "ExtractEntities",
+                    func(_ *helpers.AlertProcessor, _ map[string]interface{}, _ string, _ []models.EntityExtraction) []map[string]interface{} {
+                        return []map[string]interface{}{{"entity": "extracted"}}
+                    })
+            },
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            monitor := NewAlertMonitor(new(MockKafkaRepository))
+            processor := helpers.NewAlertProcessor()
+            
+            if tt.setup != nil {
+                tt.setup(processor)
+            }
+
+            patches := gomonkey.ApplyFunc(helpers.NewAlertProcessor,
+                func() *helpers.AlertProcessor {
+                    return processor
+                })
+            defer patches.Reset()
+
+            monitor.preprocessAlert(tt.alertData, tt.result)
+            
+            // Verify the alert has been processed
+            assert.Contains(t, tt.alertData, "type")
+            assert.Contains(t, tt.alertData, "entity")
+        })
+    }
+}
