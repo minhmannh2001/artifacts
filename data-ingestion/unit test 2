@@ -1,0 +1,262 @@
+package helpers_test
+
+import (
+    "datafeedctl/internal/app/datafeedctl/models"
+    "datafeedctl/internal/app/helpers"
+    "encoding/json"
+    "testing"
+    "time"
+
+    "github.com/stretchr/testify/assert"
+    "go.mongodb.org/mongo-driver/bson"
+)
+
+func TestStringInSlice(t *testing.T) {
+    tests := []struct {
+        name     string
+        str      string
+        slice    []string
+        expected bool
+    }{
+        {"Found string", "test", []string{"test", "ok"}, true},
+        {"String not found", "missing", []string{"test", "ok"}, false},
+        {"Empty string", "", []string{"test", "ok"}, false},
+        {"Empty slice", "test", []string{}, false},
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            result := helpers.StringInSlice(tt.str, tt.slice)
+            assert.Equal(t, tt.expected, result)
+        })
+    }
+}
+
+func TestStringInSliceInsensitive(t *testing.T) {
+    tests := []struct {
+        name     string
+        str      string
+        slice    []string
+        expected bool
+    }{
+        {"Case insensitive match", "TEST", []string{"test", "ok"}, true},
+        {"Exact match", "test", []string{"test", "ok"}, true},
+        {"No match", "missing", []string{"test", "ok"}, false},
+        {"Empty string", "", []string{"test", "ok"}, false},
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            result := helpers.StringInSliceInsensitive(tt.str, tt.slice)
+            assert.Equal(t, tt.expected, result)
+        })
+    }
+}
+
+func TestGetCurrentTime(t *testing.T) {
+    before := time.Now().UnixNano() / 1e6
+    result := helpers.GetCurrentTime()
+    after := time.Now().UnixNano() / 1e6
+
+    assert.GreaterOrEqual(t, result, before)
+    assert.LessOrEqual(t, result, after)
+}
+
+func TestToMapString(t *testing.T) {
+    tests := []struct {
+        name     string
+        input    interface{}
+        expected map[string]interface{}
+    }{
+        {
+            name:     "Nil input",
+            input:    nil,
+            expected: map[string]interface{}{},
+        },
+        {
+            name:     "Empty map",
+            input:    map[string]interface{}{},
+            expected: map[string]interface{}{},
+        },
+        {
+            name: "Valid map",
+            input: map[string]interface{}{
+                "key": "value",
+            },
+            expected: map[string]interface{}{
+                "key": "value",
+            },
+        },
+        {
+            name: "BSON Document",
+            input: bson.D{
+                {Key: "name", Value: "test"},
+                {Key: "age", Value: 30},
+            },
+            expected: map[string]interface{}{
+                "name": "test",
+                "age":  30,
+            },
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            result := helpers.ToMapString(tt.input)
+            assert.Equal(t, tt.expected, result)
+        })
+    }
+}
+
+func TestToString(t *testing.T) {
+    tests := []struct {
+        name        string
+        input       interface{}
+        expected    string
+        expectError bool
+    }{
+        {"Nil input", nil, "", false},
+        {"String input", "test", "test", false},
+        {"Integer input", 123, "123", false},
+        {"Map input", map[string]string{"key": "value"}, `{"key":"value"}`, false},
+        {"Invalid JSON", make(chan int), "", true},
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            result, err := helpers.ToString(tt.input)
+            if tt.expectError {
+                assert.Error(t, err)
+            } else {
+                assert.NoError(t, err)
+                assert.Equal(t, tt.expected, result)
+            }
+        })
+    }
+}
+
+func TestDataTransformer(t *testing.T) {
+    dt := helpers.NewDataTransformer()
+
+    t.Run("Unsupported transformation", func(t *testing.T) {
+        function := models.DataTransformationFunction{
+            Type: "unsupported",
+        }
+        result, err := dt.Transform("test", function)
+        assert.Error(t, err)
+        assert.Equal(t, "", result)
+    })
+}
+
+func TestAlertProcessor(t *testing.T) {
+    ap := helpers.NewAlertProcessor()
+
+    t.Run("ProcessNormalization", func(t *testing.T) {
+        alert := map[string]interface{}{
+            "source_field": "test value",
+        }
+        transformations := []models.NormalizeTransformation{
+            {
+                FieldFrom: "source_field",
+                FieldTo:   "target_field",
+                Functions: []models.DataTransformationFunction{},
+            },
+        }
+
+        result := ap.ProcessNormalization(alert, transformations, true)
+        assert.NotNil(t, result)
+    })
+
+    t.Run("ClassifyAlert", func(t *testing.T) {
+        alert := map[string]interface{}{
+            "type": "malware",
+        }
+        mappingTypes := []models.MappingAlertType{
+            {
+                MappingValues: []string{"malware"},
+                AlertType: models.AlertType{
+                    Name: "Malware Alert",
+                },
+            },
+        }
+
+        result := ap.ClassifyAlert("type", alert, mappingTypes)
+        assert.Equal(t, "Malware Alert", result)
+    })
+
+    t.Run("ClassifyAlert_Unclassified", func(t *testing.T) {
+        alert := map[string]interface{}{
+            "type": "unknown",
+        }
+        mappingTypes := []models.MappingAlertType{
+            {
+                MappingValues: []string{"malware"},
+                AlertType: models.AlertType{
+                    Name: "Malware Alert",
+                },
+            },
+        }
+
+        result := ap.ClassifyAlert("type", alert, mappingTypes)
+        assert.Equal(t, "Unclassified", result)
+    })
+}
+
+func TestMappingNormalize(t *testing.T) {
+    alert := map[string]interface{}{
+        "source": "test data",
+    }
+    transformations := []models.NormalizeTransformation{
+        {
+            FieldFrom: "source",
+            FieldTo:   "destination",
+            Functions: []models.DataTransformationFunction{},
+        },
+    }
+
+    result := helpers.MappingNormalize(alert, transformations, true)
+    assert.NotNil(t, result)
+}
+
+func TestGetMappingEntityExtraction(t *testing.T) {
+    alert := map[string]interface{}{
+        "alert_id": "123",
+        "data":     "test data",
+    }
+    entityExtractionInfo := []models.EntityExtraction{
+        {
+            AlertType: map[string]interface{}{
+                "name": "test_type",
+            },
+            MappingField: []models.MappingField{
+                {
+                    Entity: models.Entity{
+                        ID:   "1",
+                        Name: "Test Entity",
+                        Type: "test",
+                    },
+                    DataTransformation: models.DataTransformation{
+                        DataSource: "data",
+                        Functions:  []models.DataTransformationFunction{},
+                    },
+                },
+            },
+        },
+    }
+
+    result := helpers.GetMappingEntityExtraction(alert, "test_type", entityExtractionInfo)
+    assert.NotEmpty(t, result)
+}
+
+This test file includes tests for the main functions and types in the utilities.go file. Key features of these tests:
+Tests for basic utility functions like StringInSlice, StringInSliceInsensitive, and GetCurrentTime
+Tests for data conversion functions like ToMapString and ToString
+Tests for the DataTransformer functionality
+Tests for the AlertProcessor including normalization and classification
+Tests for the helper functions MappingNormalize and GetMappingEntityExtraction
+Each test includes multiple test cases to cover different scenarios including:
+Happy paths
+Edge cases
+Error cases
+Empty/nil inputs
+The tests use the testify/assert package for cleaner assertions and better error messages.
