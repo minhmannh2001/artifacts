@@ -1,0 +1,264 @@
+package monitor
+
+import (
+    "datafeedctl/internal/app/helpers"
+    "encoding/json"
+    "errors"
+    "testing"
+    "time"
+
+    "github.com/confluentinc/confluent-kafka-go/kafka"
+    "github.com/stretchr/testify/assert"
+    "github.com/stretchr/testify/mock"
+)
+
+// Mock Kafka Repository
+type MockKafkaRepository struct {
+    mock.Mock
+}
+
+func (m *MockKafkaRepository) GetKafkaRepository() *KafkaRepository {
+    args := m.Called()
+    return args.Get(0).(*KafkaRepository)
+}
+
+func (m *MockKafkaRepository) SendKafkaMessage(message []byte, topic string) {
+    m.Called(message, topic)
+}
+
+func (m *MockKafkaRepository) SubscribeTopics(topics []string, rebalanceCb kafka.RebalanceCb) error {
+    args := m.Called(topics, rebalanceCb)
+    return args.Error(0)
+}
+
+func (m *MockKafkaRepository) ReadMessageBatch(timeout time.Duration, batchSize int) ([]*kafka.Message, error) {
+    args := m.Called(timeout, batchSize)
+    return args.Get(0).([]*kafka.Message), args.Error(1)
+}
+
+func (m *MockKafkaRepository) CommitMessage(msg *kafka.Message) (kafka.TopicPartition, error) {
+    args := m.Called(msg)
+    return args.Get(0).(kafka.TopicPartition), args.Error(1)
+}
+
+func (m *MockKafkaRepository) Close() {
+    m.Called()
+}
+
+// Test NewAlertMonitor
+func TestNewAlertMonitor(t *testing.T) {
+    mockKafka := new(MockKafkaRepository)
+    monitor := NewAlertMonitor(mockKafka)
+
+    assert.NotNil(t, monitor)
+    assert.Equal(t, mockKafka, monitor.kafkaService)
+    assert.NotNil(t, monitor.stopChan)
+}
+
+// Test handleKafkaRebalance
+func TestHandleKafkaRebalance(t *testing.T) {
+    tests := []struct {
+        name          string
+        event         kafka.Event
+        expectedError error
+    }{
+        {
+            name:          "Assigned Partitions",
+            event:         kafka.AssignedPartitions{},
+            expectedError: nil,
+        },
+        {
+            name:          "Revoked Partitions",
+            event:         kafka.RevokedPartitions{},
+            expectedError: nil,
+        },
+        {
+            name:          "Unknown Event",
+            event:         &kafka.Message{},
+            expectedError: nil,
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            consumer := &kafka.Consumer{}
+            err := handleKafkaRebalance(consumer, tt.event)
+            assert.Equal(t, tt.expectedError, err)
+        })
+    }
+}
+
+// Test convertMessagesToAlerts
+func TestConvertMessagesToAlerts(t *testing.T) {
+    tests := []struct {
+        name           string
+        messages       []*kafka.Message
+        expectedCount  int
+        expectingError bool
+    }{
+        {
+            name: "Valid Messages",
+            messages: []*kafka.Message{
+                {
+                    Value: []byte(`{"data":{"alert":{},"tenant":"test"},"running_mode":"INGESTING"}`),
+                },
+            },
+            expectedCount:  1,
+            expectingError: false,
+        },
+        {
+            name: "Invalid JSON",
+            messages: []*kafka.Message{
+                {
+                    Value: []byte(`invalid json`),
+                },
+            },
+            expectedCount:  0,
+            expectingError: true,
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            monitor := NewAlertMonitor(new(MockKafkaRepository))
+            alerts := monitor.convertMessagesToAlerts(tt.messages)
+            assert.Equal(t, tt.expectedCount, len(alerts))
+        })
+    }
+}
+
+// Test sendToDLQ
+func TestSendToDLQ(t *testing.T) {
+    tests := []struct {
+        name          string
+        alerts        []helpers.AlertWithEvents
+        dlqTopic      string
+        processingErr error
+        expectError   bool
+    }{
+        {
+            name: "Successful DLQ Send",
+            alerts: []helpers.AlertWithEvents{
+                {Tenant: "test"},
+            },
+            dlqTopic:      "test-dlq",
+            processingErr: errors.New("test error"),
+            expectError:   false,
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            mockKafka := new(MockKafkaRepository)
+            kafkaRepo := &KafkaRepository{}
+            mockKafka.On("GetKafkaRepository").Return(kafkaRepo)
+            mockKafka.On("SendKafkaMessage", mock.Anything, tt.dlqTopic).Return()
+
+            monitor := NewAlertMonitor(mockKafka)
+            err := monitor.sendToDLQ(tt.alerts, tt.dlqTopic, tt.processingErr)
+
+            if tt.expectError {
+                assert.Error(t, err)
+            } else {
+                assert.NoError(t, err)
+            }
+            mockKafka.AssertExpectations(t)
+        })
+    }
+}
+
+// Test forwardAlertsToSoarAPI
+func TestForwardAlertsToSoarAPI(t *testing.T) {
+    tests := []struct {
+        name          string
+        alerts        []helpers.AlertWithEvents
+        expectError   bool
+        expectFailure bool
+    }{
+        {
+            name:          "Empty Alerts",
+            alerts:        []helpers.AlertWithEvents{},
+            expectError:   false,
+            expectFailure: false,
+        },
+        {
+            name: "Single Tenant Alerts",
+            alerts: []helpers.AlertWithEvents{
+                {Tenant: "tenant1"},
+                {Tenant: "tenant1"},
+            },
+            expectError:   false,
+            expectFailure: false,
+        },
+        {
+            name: "Multiple Tenant Alerts",
+            alerts: []helpers.AlertWithEvents{
+                {Tenant: "tenant1"},
+                {Tenant: "tenant2"},
+            },
+            expectError:   false,
+            expectFailure: false,
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            monitor := NewAlertMonitor(new(MockKafkaRepository))
+            err, failedAlerts := monitor.forwardAlertsToSoarAPI(tt.alerts)
+
+            if tt.expectError {
+                assert.Error(t, err)
+                assert.NotNil(t, failedAlerts)
+            } else {
+                assert.NoError(t, err)
+                assert.Nil(t, failedAlerts)
+            }
+        })
+    }
+}
+
+// Test commitProcessedMessages
+func TestCommitProcessedMessages(t *testing.T) {
+    tests := []struct {
+        name     string
+        messages []*kafka.Message
+    }{
+        {
+            name: "Commit Single Message",
+            messages: []*kafka.Message{
+                {Value: []byte("test")},
+            },
+        },
+        {
+            name:     "Commit Empty Messages",
+            messages: []*kafka.Message{},
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            mockKafka := new(MockKafkaRepository)
+            for _, msg := range tt.messages {
+                mockKafka.On("CommitMessage", msg).Return(kafka.TopicPartition{}, nil)
+            }
+
+            monitor := NewAlertMonitor(mockKafka)
+            monitor.commitProcessedMessages(tt.messages, mockKafka)
+            mockKafka.AssertExpectations(t)
+        })
+    }
+}
+
+// Test Stop
+func TestStop(t *testing.T) {
+    monitor := NewAlertMonitor(new(MockKafkaRepository))
+    monitor.Stop()
+
+    // Verify channel is closed by trying to send to it
+    select {
+    case <-monitor.stopChan:
+        // Channel is closed as expected
+    default:
+        t.Error("Stop channel was not closed")
+    }
+}
