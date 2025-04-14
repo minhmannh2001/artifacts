@@ -1,0 +1,409 @@
+Q:rewrite the container package, i want to separate between docker execution and the logic of this app, refactor all about container to easy maintain and easy understanding
+A: I'll help you refactor the container package to separate concerns and improve maintainability. Here's a proposed restructuring:
+
+1. data-ingestion/internal/app/jobworker/worker/container/types.go
+package container
+
+import (
+    "bufio"
+    "io"
+    "os/exec"
+    "time"
+)
+
+// ContainerStatus represents the state of a container
+type ContainerStatus int
+
+const (
+    StatusStopped ContainerStatus = iota
+    StatusReady
+    StatusRunning
+)
+
+// ContainerConfig holds configuration for creating a new container
+type ContainerConfig struct {
+    Name      string
+    Image     string
+    Tenant    string
+    NetworkConfig NetworkConfig
+    EnvVars   map[string]string
+}
+
+// NetworkConfig holds network-related configuration
+type NetworkConfig struct {
+    Name      string
+    DNS       []string
+    DNSSearch []string
+    DNSOpt    []string
+    Hosts     []string
+}
+
+// Container represents a worker container instance
+type Container struct {
+    config     ContainerConfig
+    status     ContainerStatus
+    changeTime time.Time
+    runtime    RuntimeService
+}
+
+// ExecutionResult represents the output of a container execution
+type ExecutionResult struct {
+    Type          string                 `json:"type,omitempty"`
+    ErrMessage    string                 `json:"error_message,omitempty"`
+    Message       string                 `json:"message,omitempty"`
+    Results       map[string]interface{} `json:"results,omitempty"`
+    ResultsType   map[string]interface{} `json:"results_type,omitempty"`
+    Integration   string                 `json:"integration,omitempty"`
+    Script        string                 `json:"script,omitempty"`
+    Command       string                 `json:"command,omitempty"`
+    Instance      string                 `json:"instance,omitempty"`
+    Args          interface{}            `json:"args,omitempty"`
+}
+
+// ExecutionContext represents the context for container execution
+type ExecutionContext struct {
+    Script        string      `json:"script,omitempty"`
+    Command       string      `json:"command"`
+    Args          interface{} `json:"args"`
+    Params        interface{} `json:"params"`
+    Native        bool        `json:"native"`
+    IntegrationID string      `json:"integrationid"`
+}
+
+2. data-ingestion/internal/app/jobworker/worker/container/runtime.go
+
+package container
+
+import (
+    "context"
+    "io"
+)
+
+// RuntimeService defines the interface for container runtime operations
+type RuntimeService interface {
+    CreateContainer(ctx context.Context, config ContainerConfig) error
+    StartContainer(ctx context.Context) error
+    StopContainer(ctx context.Context) error
+    ExecuteCommand(ctx context.Context, command string) (io.WriteCloser, *bufio.Scanner, error)
+    IsHealthy(ctx context.Context) bool
+    Cleanup(ctx context.Context) error
+}
+
+// DockerRuntime implements RuntimeService for Docker
+type DockerRuntime struct {
+    containerID string
+    stdin       io.WriteCloser
+    stdout      *bufio.Scanner
+    cmd         *exec.Cmd
+}
+
+func NewDockerRuntime() *DockerRuntime {
+    return &DockerRuntime{}
+}
+
+func (d *DockerRuntime) CreateContainer(ctx context.Context, config ContainerConfig) error {
+    args := d.buildDockerArgs(config)
+    cmd := exec.CommandContext(ctx, "docker", args...)
+    
+    stdin, err := cmd.StdinPipe()
+    if err != nil {
+        return fmt.Errorf("failed to create stdin pipe: %w", err)
+    }
+    
+    stdout, err := cmd.StdoutPipe()
+    if err != nil {
+        return fmt.Errorf("failed to create stdout pipe: %w", err)
+    }
+    
+    d.stdin = stdin
+    d.stdout = bufio.NewScanner(stdout)
+    d.cmd = cmd
+    
+    return nil
+}
+
+func (d *DockerRuntime) buildDockerArgs(config ContainerConfig) []string {
+    args := []string{
+        "run",
+        "--rm",
+        "--name", config.Name,
+        "-i",
+        "--log-driver", "json-file",
+        "--log-opt", "max-size=2m",
+    }
+    
+    // Add network configuration
+    if config.NetworkConfig.Name != "" {
+        args = append(args, fmt.Sprintf("--network=%s", config.NetworkConfig.Name))
+    }
+    
+    // Add DNS configuration
+    for _, dns := range config.NetworkConfig.DNS {
+        args = append(args, "--dns", dns)
+    }
+    
+    // Add environment variables
+    for key, value := range config.EnvVars {
+        args = append(args, "-e", fmt.Sprintf("%s=%s", key, value))
+    }
+    
+    // Add image name
+    args = append(args, config.Image)
+    
+    return args
+}
+
+// Implement other RuntimeService methods...
+3. data-ingestion/internal/app/jobworker/worker/container/container.go
+
+package container
+
+import (
+    "context"
+    "encoding/json"
+    "fmt"
+    "sync"
+    "time"
+    
+    "go.uber.org/zap"
+)
+
+// Manager handles container lifecycle and pooling
+type Manager struct {
+    containers  []*Container
+    maxWorkers  int
+    mu          sync.RWMutex
+    logger      *zap.Logger
+}
+
+func NewManager(maxWorkers int, logger *zap.Logger) *Manager {
+    return &Manager{
+        containers: make([]*Container, maxWorkers),
+        maxWorkers: maxWorkers,
+        logger:     logger,
+    }
+}
+
+func NewContainer(config ContainerConfig) *Container {
+    return &Container{
+        config:     config,
+        status:     StatusStopped,
+        changeTime: time.Now(),
+        runtime:    NewDockerRuntime(),
+    }
+}
+
+func (c *Container) Start(ctx context.Context) error {
+    if c.status != StatusStopped {
+        return fmt.Errorf("container must be stopped before starting")
+    }
+
+    if err := c.runtime.CreateContainer(ctx, c.config); err != nil {
+        return fmt.Errorf("failed to create container: %w", err)
+    }
+
+    if err := c.runtime.StartContainer(ctx); err != nil {
+        return fmt.Errorf("failed to start container: %w", err)
+    }
+
+    c.status = StatusReady
+    c.changeTime = time.Now()
+    return nil
+}
+
+func (c *Container) Stop(ctx context.Context) error {
+    if c.status == StatusStopped {
+        return nil
+    }
+
+    if err := c.runtime.StopContainer(ctx); err != nil {
+        return fmt.Errorf("failed to stop container: %w", err)
+    }
+
+    c.status = StatusStopped
+    c.changeTime = time.Now()
+    return nil
+}
+
+func (c *Container) Execute(ctx context.Context, execContext ExecutionContext) (*ExecutionResult, error) {
+    if c.status != StatusReady {
+        return nil, fmt.Errorf("container not ready for execution")
+    }
+
+    c.status = StatusRunning
+    defer func() {
+        c.status = StatusReady
+        c.changeTime = time.Now()
+    }()
+
+    contextJSON, err := json.Marshal(execContext)
+    if err != nil {
+        return nil, fmt.Errorf("failed to marshal execution context: %w", err)
+    }
+
+    stdin, stdout, err := c.runtime.ExecuteCommand(ctx, string(contextJSON))
+    if err != nil {
+        return nil, fmt.Errorf("failed to execute command: %w", err)
+    }
+    defer stdin.Close()
+
+    return c.processOutput(stdout)
+}
+
+func (c *Container) processOutput(scanner *bufio.Scanner) (*ExecutionResult, error) {
+    var result ExecutionResult
+    
+    for scanner.Scan() {
+        var output ExecutionResult
+        if err := json.Unmarshal(scanner.Bytes(), &output); err != nil {
+            continue
+        }
+        
+        // Process different output types
+        switch output.Type {
+        case "result":
+            result = output
+        case "error":
+            return &output, fmt.Errorf(output.ErrMessage)
+        case "completed":
+            return &result, nil
+        }
+    }
+    
+    return &result, nil
+}
+
+4. package container
+
+package container
+
+import (
+    "context"
+    "fmt"
+    "sync"
+    "time"
+    
+    "go.uber.org/zap"
+)
+
+// Pool manages a pool of containers for a specific tenant
+type Pool struct {
+    containers     []*Container
+    maxContainers  int
+    tenant         string
+    mu            sync.RWMutex
+    logger        *zap.Logger
+}
+
+func NewPool(maxContainers int, tenant string, logger *zap.Logger) *Pool {
+    return &Pool{
+        containers:    make([]*Container, 0, maxContainers),
+        maxContainers: maxContainers,
+        tenant:       tenant,
+        logger:       logger,
+    }
+}
+
+func (p *Pool) AcquireContainer(ctx context.Context, image string) (*Container, error) {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+
+    // Try to find a ready container with the same image
+    for _, container := range p.containers {
+        if container.status == StatusReady && container.config.Image == image {
+            return container, nil
+        }
+    }
+
+    // Try to find a stopped container
+    for _, container := range p.containers {
+        if container.status == StatusStopped {
+            container.config.Image = image
+            if err := container.Start(ctx); err != nil {
+                p.logger.Error("Failed to start container", zap.Error(err))
+                continue
+            }
+            return container, nil
+        }
+    }
+
+    // Create new container if pool not full
+    if len(p.containers) < p.maxContainers {
+        container := NewContainer(ContainerConfig{
+            Name:   fmt.Sprintf("worker_%s_%d", p.tenant, len(p.containers)),
+            Image:  image,
+            Tenant: p.tenant,
+        })
+        
+        if err := container.Start(ctx); err != nil {
+            return nil, err
+        }
+        
+        p.containers = append(p.containers, container)
+        return container, nil
+    }
+
+    return nil, fmt.Errorf("no available containers")
+}
+
+func (p *Pool) ReleaseContainer(container *Container) {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+    
+    container.status = StatusReady
+    container.changeTime = time.Now()
+}
+
+5. sum
+
+This refactoring provides several benefits:
+Separation of Concerns:
+types.go: Defines core data structures
+runtime.go: Handles container runtime operations (Docker-specific code)
+container.go: Manages individual container lifecycle
+pool.go: Handles container pooling and allocation
+Interface-based Design:
+RuntimeService interface allows for different container runtimes
+Easy to add support for other container runtimes (e.g., containerd, podman)
+Improved Error Handling:
+Consistent error wrapping
+Better context propagation
+Better Resource Management:
+Clear container lifecycle states
+Proper cleanup handling
+Thread-safe operations
+
+func main() {
+    logger := logz.GetDevLogger()
+    
+    // Create a container pool for a tenant
+    pool := container.NewPool(
+        viper.GetInt("worker.numberOfInstances"),
+        "tenant1",
+        logger,
+    )
+    
+    // Acquire a container
+    ctx := context.Background()
+    container, err := pool.AcquireContainer(ctx, "python:3.9")
+    if err != nil {
+        logger.Error("Failed to acquire container", zap.Error(err))
+        return
+    }
+    defer pool.ReleaseContainer(container)
+    
+    // Execute a task
+    result, err := container.Execute(ctx, container.ExecutionContext{
+        Command: "python script.py",
+        Args:    map[string]interface{}{"param1": "value1"},
+    })
+    if err != nil {
+        logger.Error("Execution failed", zap.Error(err))
+        return
+    }
+    
+    // Process results
+    logger.Info("Execution successful", zap.Any("result", result))
+}
+
+This refactoring makes the code more maintainable, testable, and easier to understand while providing a clear separation between Docker-specific code and the application's business logic.
