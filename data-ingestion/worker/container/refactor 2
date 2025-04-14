@@ -1,0 +1,108 @@
+I'll refactor the Execute function to properly handle timeouts and container cleanup:
+
+data-ingestion/internal/app/jobworker/worker/jobhandler/job_handler.go
+
+func (j *JobHandlers) Execute(ctx context.Context, job model.DatafeedJob, jobInfo helpers.Job) (output.Output, error) {
+    var container container.IContainer
+    
+    // Create a channel for results
+    type result struct {
+        output output.Output
+        err    error
+    }
+    resultChan := make(chan result, 1)
+    
+    // Find available container with timeout
+    for {
+        select {
+        case <-ctx.Done():
+            return output.Output{}, fmt.Errorf("context cancelled while finding container: %w", ctx.Err())
+        default:
+            idx := j.containerRepo.FindFreeIndex(j.pythonBaseImage, jobInfo.Tenant)
+            if idx == -1 {
+                time.Sleep(300 * time.Millisecond)
+                continue
+            }
+            container = j.containerRepo.GetContainerByIndex(idx)
+            j.logger.Info("Found container", zap.String("container_name", container.GetName()))
+            goto EXECUTE // Break nested loop
+        }
+    }
+
+EXECUTE:
+    // Execute job in goroutine to handle timeout
+    go func() {
+        output, err := container.Run(job.Name, job.Context, job.Args, job.RequestID, job.TaskID)
+        resultChan <- result{output: output, err: err}
+    }()
+
+    // Wait for either completion or timeout
+    select {
+    case <-ctx.Done():
+        // Context cancelled or timed out
+        j.logger.Warn("Job execution timed out or cancelled",
+            zap.String("container", container.GetName()),
+            zap.String("job_name", job.Name),
+            zap.String("request_id", job.RequestID),
+        )
+        
+        // Stop the container forcefully
+        if err := container.StopContainer(); err != nil {
+            j.logger.Error("Failed to stop container after timeout",
+                zap.String("container", container.GetName()),
+                zap.Error(err),
+            )
+        }
+        
+        return output.Output{}, fmt.Errorf("job execution timed out or cancelled: %w", ctx.Err())
+        
+    case res := <-resultChan:
+        // Job completed (successfully or with error)
+        if res.err != nil {
+            j.logger.Error("Job execution failed",
+                zap.String("container", container.GetName()),
+                zap.String("job_name", job.Name),
+                zap.Error(res.err),
+            )
+        } else {
+            j.logger.Debug("Job execution completed",
+                zap.String("container", container.GetName()),
+                zap.String("job_name", job.Name),
+            )
+        }
+        return res.output, res.err
+    }
+}
+
+Key improvements in this refactoring:
+Proper Timeout Handling:
+Uses a goroutine to run the job asynchronously
+Uses select to handle both completion and timeout cases
+Properly stops the container when timeout occurs
+Better Resource Management:
+Container is stopped when timeout occurs
+Uses a result channel to collect output and errors
+Improved Error Handling:
+More detailed error messages
+Better context propagation
+Proper logging at each step
+Better Code Structure:
+Separates container acquisition from job execution
+Uses goto to break nested loop (a reasonable use case for goto)
+Clear separation between timeout and success paths
+To use this refactored function, you would typically call it with a timeout context:
+
+// In the calling code:
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+defer cancel()
+
+output, err := jobHandler.Execute(ctx, job, jobInfo)
+if err != nil {
+    // Handle timeout or execution error
+}
+
+This implementation ensures that:
+The job will be cancelled if it exceeds the context timeout
+The container will be properly stopped when timeout occurs
+Resources are properly cleaned up in all cases
+The execution status is properly logged
