@@ -1,0 +1,273 @@
+there is problem because fetch alerts and fetch events are trying to obtain container to run, and there is timeout for getting events, so if containers are obtained by getting alert process, there will be no events for some alerts, can you recommend any way to improve docker container management
+
+Yes, this is a good observation. The current container management system can lead to resource contention between alert and event collection processes. Here are several approaches to improve the container management:
+
+1. Dedicated Container Pools:
+data-ingestion/internal/app/jobworker/worker/container/container_pool.go
+
+package container
+
+import (
+    "context"
+    "sync"
+    "time"
+)
+
+type ContainerPoolType string
+
+const (
+    AlertCollectionPool ContainerPoolType = "ALERT_COLLECTION"
+    EventCollectionPool ContainerPoolType = "EVENT_COLLECTION"
+)
+
+type ContainerPool struct {
+    containers     []*Container
+    inUse         map[string]bool
+    mu            sync.RWMutex
+    poolType      ContainerPoolType
+    maxContainers int
+    tenant        string
+}
+
+type PoolManager struct {
+    alertPools map[string]*ContainerPool  // key: tenant
+    eventPools map[string]*ContainerPool  // key: tenant
+    mu         sync.RWMutex
+}
+
+func NewPoolManager(config PoolConfig) *PoolManager {
+    return &PoolManager{
+        alertPools: make(map[string]*ContainerPool),
+        eventPools: make(map[string]*ContainerPool),
+    }
+}
+
+func (pm *PoolManager) GetContainer(ctx context.Context, poolType ContainerPoolType, tenant string) (*Container, error) {
+    pm.mu.RLock()
+    pool, exists := pm.getPool(poolType, tenant)
+    pm.mu.RUnlock()
+
+    if !exists {
+        pm.mu.Lock()
+        pool = pm.createPool(poolType, tenant)
+        pm.mu.Unlock()
+    }
+
+    return pool.acquireContainer(ctx)
+}
+
+func (p *ContainerPool) acquireContainer(ctx context.Context) (*Container, error) {
+    for {
+        select {
+        case <-ctx.Done():
+            return nil, ctx.Err()
+        default:
+            p.mu.Lock()
+            for i, container := range p.containers {
+                if !p.inUse[container.ID] {
+                    p.inUse[container.ID] = true
+                    p.mu.Unlock()
+                    return container, nil
+                }
+            }
+            
+            // If we have room to create a new container
+            if len(p.containers) < p.maxContainers {
+                container := NewContainer(ContainerConfig{
+                    PoolType: p.poolType,
+                    Tenant:   p.tenant,
+                })
+                p.containers = append(p.containers, container)
+                p.inUse[container.ID] = true
+                p.mu.Unlock()
+                return container, nil
+            }
+            p.mu.Unlock()
+            
+            // Wait before trying again
+            time.Sleep(100 * time.Millisecond)
+        }
+    }
+}
+
+func (p *ContainerPool) releaseContainer(container *Container) {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+    p.inUse[container.ID] = false
+}
+
+2. Resource Allocation Strategy:
+data-ingestion/internal/app/jobworker/worker/container/resource_allocator.go
+
+
+package container
+
+import (
+    "context"
+    "time"
+)
+
+type ResourceAllocator struct {
+    poolManager    *PoolManager
+    alertPoolSize  int
+    eventPoolSize  int
+    maxWaitTime    time.Duration
+}
+
+type ContainerLease struct {
+    Container *Container
+    Release   func()
+}
+
+func (ra *ResourceAllocator) AllocateForAlertCollection(ctx context.Context, tenant string) (*ContainerLease, error) {
+    container, err := ra.poolManager.GetContainer(ctx, AlertCollectionPool, tenant)
+    if err != nil {
+        return nil, err
+    }
+
+    return &ContainerLease{
+        Container: container,
+        Release: func() {
+            ra.poolManager.alertPools[tenant].releaseContainer(container)
+        },
+    }, nil
+}
+
+func (ra *ResourceAllocator) AllocateForEventCollection(ctx context.Context, tenant string) (*ContainerLease, error) {
+    container, err := ra.poolManager.GetContainer(ctx, EventCollectionPool, tenant)
+    if err != nil {
+        return nil, err
+    }
+
+    return &ContainerLease{
+        Container: container,
+        Release: func() {
+            ra.poolManager.eventPools[tenant].releaseContainer(container)
+        },
+    }, nil
+}
+
+3. Updated Alert Collector Implementation:
+data-ingestion/internal/app/jobworker/worker/alertcollector/alert_collector.go
+
+type AlertCollector struct {
+    resourceAllocator *ResourceAllocator
+    // ... other fields
+}
+
+func (ac *AlertCollector) collectAlertsAndEvents(ctx context.Context, source *domain.AlertSource) error {
+    // Get container for alert collection
+    alertLease, err := ac.resourceAllocator.AllocateForAlertCollection(ctx, source.TenantID)
+    if err != nil {
+        return fmt.Errorf("failed to allocate container for alert collection: %w", err)
+    }
+    defer alertLease.Release()
+
+    // Collect alerts
+    alerts, err := ac.collectAlerts(ctx, source, alertLease.Container)
+    if err != nil {
+        return err
+    }
+
+    // Create a buffered channel to control concurrent event collection
+    eventChan := make(chan domain.CollectedAlert, len(alerts))
+    resultChan := make(chan domain.CollectedAlert, len(alerts))
+    errorChan := make(chan error, 1)
+
+    // Start event collector workers
+    for i := 0; i < ac.config.MaxEventCollectors; i++ {
+        go ac.eventCollectorWorker(ctx, source, eventChan, resultChan, errorChan)
+    }
+
+    // Send alerts to be processed
+    go func() {
+        for _, alert := range alerts {
+            eventChan <- alert
+        }
+        close(eventChan)
+    }()
+
+    // Collect results
+    enrichedAlerts := make([]domain.CollectedAlert, 0, len(alerts))
+    for i := 0; i < len(alerts); i++ {
+        select {
+        case result := <-resultChan:
+            enrichedAlerts = append(enrichedAlerts, result)
+        case err := <-errorChan:
+            return err
+        case <-ctx.Done():
+            return ctx.Err()
+        }
+    }
+
+    return ac.resultHandler.HandleCollectionResult(*source, enrichedAlerts)
+}
+
+func (ac *AlertCollector) eventCollectorWorker(
+    ctx context.Context,
+    source *domain.AlertSource,
+    alerts <-chan domain.CollectedAlert,
+    results chan<- domain.CollectedAlert,
+    errorChan chan<- error,
+) {
+    for alert := range alerts {
+        // Get container for event collection
+        eventLease, err := ac.resourceAllocator.AllocateForEventCollection(ctx, source.TenantID)
+        if err != nil {
+            errorChan <- err
+            return
+        }
+
+        events, err := ac.collectEvents(ctx, alert, eventLease.Container)
+        eventLease.Release()
+
+        if err != nil {
+            alert.CollectionErrors = append(alert.CollectionErrors, err.Error())
+        } else {
+            alert.RelatedEvents = events
+        }
+
+        results <- alert
+    }
+}
+
+4. Configuration:
+data-ingestion/internal/app/jobworker/config/container_config.go
+
+package config
+
+type ContainerConfig struct {
+    AlertPoolSize     int           `mapstructure:"alert_pool_size"`
+    EventPoolSize     int           `mapstructure:"event_pool_size"`
+    MaxEventCollectors int          `mapstructure:"max_event_collectors"`
+    ContainerTimeout  time.Duration `mapstructure:"container_timeout"`
+    MaxRetries       int           `mapstructure:"max_retries"`
+    RetryDelay       time.Duration `mapstructure:"retry_delay"`
+}
+
+5. sum
+Key improvements in this approach:
+Separate Container Pools: Maintains separate pools for alert collection and event collection, preventing resource contention between the two processes.
+Resource Leasing: Uses a lease-based system to ensure containers are properly released after use.
+Controlled Concurrency: Implements worker pools for event collection with configurable concurrency limits.
+Fair Resource Distribution: Each tenant gets their own pools, ensuring fair resource distribution across tenants.
+Graceful Timeout Handling: Better timeout handling with context cancellation and proper resource cleanup.
+Flexible Configuration: Allows for fine-tuning of pool sizes and other parameters per environment needs.
+To implement this:
+Update your configuration:
+
+container:
+  alert_pool_size: 5
+  event_pool_size: 10
+  max_event_collectors: 3
+  container_timeout: 5m
+  max_retries: 3
+  retry_delay: 1s
+
+Initialize the system:
+
+config := LoadConfig()
+poolManager := container.NewPoolManager(config)
+resourceAllocator := container.NewResourceAllocator(poolManager, config)
+alertCollector := alertcollector.NewAlertCollector(resourceAllocator, config)
+
