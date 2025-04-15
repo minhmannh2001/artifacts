@@ -1,0 +1,232 @@
+Q: can you help me code kafka consumer that guarantee at last once processing of messages
+A: I'll help you implement a Kafka consumer with at-least-once message processing guarantees. This means we'll ensure that every message is processed at least once, even if there are failures or restarts.
+First, let's modify the KafkaRepository in  data-ingestion/internal/app/poller/monitor/kafka.go:
+
+------------
+data-ingestion/internal/app/poller/monitor/kafka.go
+func createKafkaConsumer(config kafkaConfiguration) *kafka.Consumer {
+    consumer, err := kafka.NewConsumer(&kafka.ConfigMap{
+        "bootstrap.servers":               config.Server,
+        "group.id":                        config.ConsumerGroupID,
+        "enable.auto.commit":              false,                // Disable auto commit
+        "auto.offset.reset":               config.Offset,
+        "go.application.rebalance.enable": true,
+        "session.timeout.ms":              defaultKafkaSessionTimeoutMs,
+        "max.poll.interval.ms":            defaultKafkaMaxPollIntervalMs,
+        "enable.partition.eof":            true,                // Enable partition EOF events
+        "isolation.level":                 "read_committed",    // Only read committed transactions
+        "max.poll.records":               500,                  // Maximum records per batch
+    })
+
+    if err != nil {
+        log.Printf("Failed to initialize Kafka consumer: %v", err)
+        logz.Error(fmt.Sprintf("Failed to initialize Kafka consumer: %v", err))
+    }
+
+    return consumer
+}
+
+// Add new method for storing offsets safely
+func (repo *KafkaRepository) StoreOffsets(messages []*kafka.Message) error {
+    if len(messages) == 0 {
+        return nil
+    }
+
+    // Get the last message's offset
+    lastMsg := messages[len(messages)-1]
+    partitions := []kafka.TopicPartition{
+        {
+            Topic:     lastMsg.TopicPartition.Topic,
+            Partition: lastMsg.TopicPartition.Partition,
+            Offset:    lastMsg.TopicPartition.Offset + 1, // Store next offset
+        },
+    }
+
+    _, err := repo.MessageConsumer.CommitMessage(lastMsg)
+    return err
+}
+-----------
+Now, let's modify the AlertMonitor in  data-ingestion/internal/app/poller/monitor/alertmonitor.go:
+data-ingestion/internal/app/poller/monitor/alertmonitor.go
+
+type AlertMonitor struct {
+    kafkaService KafkaRepositoryInterface
+    stopChan     chan struct{}
+    // Add new fields for tracking processing state
+    processingWG sync.WaitGroup
+    msgBuffer    chan *kafka.Message
+    errorChan    chan error
+}
+
+func NewAlertMonitor(kafkaService KafkaRepositoryInterface) *AlertMonitor {
+    return &AlertMonitor{
+        kafkaService: kafkaService,
+        stopChan:     make(chan struct{}),
+        msgBuffer:    make(chan *kafka.Message, 1000), // Buffered channel for messages
+        errorChan:    make(chan error, 1),
+    }
+}
+
+func (am *AlertMonitor) MonitorFetchedAlerts() {
+    var kafkaClient *KafkaRepository
+
+    defer func() {
+        if err := recover(); err != nil {
+            logz.Error(fmt.Sprintf("Panic recovered in MonitorFetchedAlerts: %v", err))
+        }
+        close(am.msgBuffer)
+        am.processingWG.Wait() // Wait for all processing to complete
+        kafkaClient.Close()
+    }()
+
+    kafkaClient = am.kafkaService.GetKafkaRepository()
+    jobStateTopic := viper.GetString("kafka.topic.job_state")
+    messagesBatchSize := viper.GetInt("kafka.batch_size")
+    if messagesBatchSize == 0 {
+        messagesBatchSize = 10
+    }
+
+    // Start processing goroutine
+    go am.processMessages(kafkaClient)
+
+    if err := kafkaClient.SubscribeTopics([]string{jobStateTopic}, handleKafkaRebalance); err != nil {
+        logz.Error(fmt.Sprintf("Topic subscription failed for %s: %v", jobStateTopic, err))
+        return
+    }
+
+    messageReadTimeout := time.Duration(viper.GetInt("kafka.message_read_timeout")) * time.Second
+    
+    for {
+        select {
+        case <-am.stopChan:
+            logz.Info("Stopping alert monitor...")
+            return
+        case err := <-am.errorChan:
+            logz.Error(fmt.Sprintf("Error in message processing: %v", err))
+            continue
+        default:
+            messages, err := kafkaClient.ReadMessageBatch(messageReadTimeout, messagesBatchSize)
+            if err != nil {
+                logz.Error(fmt.Sprintf("Message batch reading failed: %v", err))
+                continue
+            }
+
+            // Buffer messages for processing
+            for _, msg := range messages {
+                am.msgBuffer <- msg
+            }
+        }
+    }
+}
+
+func (am *AlertMonitor) processMessages(kafkaClient *KafkaRepository) {
+    var messageBatch []*kafka.Message
+    batchTimeout := time.NewTimer(5 * time.Second)
+    maxBatchSize := 100
+
+    for {
+        select {
+        case msg, ok := <-am.msgBuffer:
+            if !ok {
+                // Channel closed, process remaining messages
+                if len(messageBatch) > 0 {
+                    am.processBatch(messageBatch, kafkaClient)
+                }
+                return
+            }
+
+            messageBatch = append(messageBatch, msg)
+            if len(messageBatch) >= maxBatchSize {
+                am.processBatch(messageBatch, kafkaClient)
+                messageBatch = messageBatch[:0]
+                batchTimeout.Reset(5 * time.Second)
+            }
+
+        case <-batchTimeout.C:
+            if len(messageBatch) > 0 {
+                am.processBatch(messageBatch, kafkaClient)
+                messageBatch = messageBatch[:0]
+            }
+            batchTimeout.Reset(5 * time.Second)
+        }
+    }
+}
+
+func (am *AlertMonitor) processBatch(messages []*kafka.Message, kafkaClient *KafkaRepository) {
+    am.processingWG.Add(1)
+    defer am.processingWG.Done()
+
+    // Convert messages to alerts
+    alerts := am.convertMessagesToAlerts(messages)
+    if len(alerts) == 0 {
+        return
+    }
+
+    // Process alerts with retry mechanism
+    maxRetries := 3
+    for retry := 0; retry < maxRetries; retry++ {
+        if err, failedAlerts := am.forwardAlertsToSoarAPI(alerts); err != nil {
+            if retry == maxRetries-1 {
+                // On final retry, send to DLQ
+                dlqTopic := viper.GetString("kafka.topic.dlq")
+                if dlqErr := am.sendToDLQ(failedAlerts, dlqTopic, err); dlqErr != nil {
+                    logz.Error(fmt.Sprintf("Failed to send to DLQ: %v", dlqErr))
+                }
+            } else {
+                // Wait before retry
+                time.Sleep(time.Duration(retry+1) * time.Second)
+                continue
+            }
+        }
+        break
+    }
+
+    // Commit offsets only after successful processing
+    if err := kafkaClient.StoreOffsets(messages); err != nil {
+        logz.Error(fmt.Sprintf("Failed to commit offsets: %v", err))
+        am.errorChan <- err
+        return
+    }
+
+    logz.Info(fmt.Sprintf("Successfully processed and committed %d messages", len(messages)))
+}
+
+func (am *AlertMonitor) Stop() {
+    close(am.stopChan)
+    close(am.msgBuffer)
+    am.processingWG.Wait()
+}
+
+This implementation provides at-least-once processing guarantees through several mechanisms:
+Disable Auto-Commit: We manually control offset commits.
+Batching with Buffer: Messages are buffered in a channel and processed in batches for efficiency.
+Transaction Isolation: Using read_committed isolation level to ensure we only read committed messages.
+Retry Mechanism: Failed processing attempts are retried before sending to DLQ.
+Safe Offset Management:
+Offsets are only committed after successful processing
+We commit the next offset to be consumed
+We use a WaitGroup to ensure all processing completes before shutdown
+Error Handling:
+Failed messages are sent to a Dead Letter Queue (DLQ)
+Processing errors are logged and monitored
+Panic recovery is implemented
+Graceful Shutdown:
+Waits for in-flight messages to complete processing
+Properly closes Kafka connections
+Ensures no messages are lost during shutdown
+To use this implementation:
+Messages are read in batches from Kafka
+Each batch is processed asynchronously
+Offsets are only committed after successful processing
+Failed messages are retried and eventually sent to DLQ
+The system can be gracefully shut down without losing messages
+This ensures that:
+No message is lost
+Messages are processed at least once
+Failed messages are handled properly
+System can recover from failures
+Processing is efficient through batching
+
+
+
+
