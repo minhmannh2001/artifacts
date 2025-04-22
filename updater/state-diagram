@@ -1,0 +1,12 @@
+stateDiagram-v2
+    [*] --> NodeConfiguring
+    NodeConfiguring --> VersionUpdated: Node configured
+    VersionUpdated --> NewVersionAvailable: New version detected
+    NewVersionAvailable --> ArtifactDownloading: Start download
+    ArtifactDownloading --> ArtifactDownloaded: Download success
+    ArtifactDownloading --> ArtifactDownloadFailed: Download error
+    ArtifactDownloaded --> VersionUpdating: Start update
+    VersionUpdating --> VersionUpdated: Update success
+    VersionUpdating --> VersionUpdateFailed: Update error
+    ArtifactDownloadFailed --> NewVersionAvailable: Retry
+    VersionUpdateFailed --> NewVersionAvailable: Retry
