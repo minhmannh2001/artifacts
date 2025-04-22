@@ -1,0 +1,29 @@
+C4Component
+    title Component Diagram - VCS-CyCir Updater API
+
+    Container(portal, "Updater Portal", "NodeJS, React", "")
+    
+    Container_Boundary(api, "Updater API") {
+        Component(router, "Router", "Gin", "Routes and middleware")
+        Component(handlers, "Handlers", "Go", "Request handlers")
+        Component(services, "Services", "Go", "Business logic")
+        Component(repos, "Repositories", "Go", "Data access")
+        Component(updater, "Updater", "Go", "State machine for updates")
+        Component(ws_hub, "WebSocket Hub", "Go", "WebSocket connections")
+    }
+
+    ContainerDb(sqlite, "SQLite DB", "SQLite", "")
+    System_Ext(harbor, "Harbor Registry", "")
+    System_Ext(nomad, "Nomad", "")
+    System_Ext(consul, "Consul", "")
+
+    Rel(portal, router, "API calls", "HTTPS")
+    Rel(router, handlers, "Routes to")
+    Rel(handlers, services, "Uses")
+    Rel(services, repos, "Uses")
+    Rel(services, updater, "Manages state via")
+    Rel(services, ws_hub, "Broadcasts via")
+    Rel(repos, sqlite, "Reads/Writes to")
+    Rel(services, harbor, "Downloads from")
+    Rel(services, nomad, "Deploys via")
+    Rel(services, consul, "Configures via")
