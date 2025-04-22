@@ -1,0 +1,15 @@
+C4Context
+    title System Context - VCS-CyCir Updater
+
+    Person(admin, "Administrator", "System administrator managing updates")
+    
+    System(updater, "VCS-CyCir Updater", "Manages system updates and versioning")
+    
+    System_Ext(harbor, "Harbor Registry", "Stores system artifacts and versions")
+    System_Ext(nomad, "Nomad", "Cluster scheduler")
+    System_Ext(consul, "Consul", "Service discovery and KV store")
+    
+    Rel(admin, updater, "Uses", "HTTPS")
+    Rel(updater, harbor, "Pulls artifacts from", "HTTPS")
+    Rel(updater, nomad, "Manages deployments", "HTTP")
+    Rel(updater, consul, "Reads/writes configuration", "HTTP")
