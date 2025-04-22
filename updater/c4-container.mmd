@@ -1,0 +1,23 @@
+C4Container
+    title Container Diagram - VCS-CyCir Updater
+
+    Person(admin, "Administrator", "System administrator")
+
+    Container_Boundary(c1, "VCS-CyCir Updater") {
+        Container(portal, "Updater Portal", "NodeJS, React", "Web interface for managing updates")
+        Container(api, "Updater API", "Go, Gin", "Handles update operations and system state")
+        Container(ws, "WebSocket Server", "Go, Gorilla", "Real-time update notifications")
+        ContainerDb(sqlite, "SQLite DB", "SQLite", "Stores system state and update history")
+    }
+
+    System_Ext(harbor, "Harbor Registry", "Artifact storage")
+    System_Ext(nomad, "Nomad", "Cluster management")
+    System_Ext(consul, "Consul", "Configuration store")
+
+    Rel(admin, portal, "Uses", "HTTPS")
+    Rel(portal, api, "Makes API calls to", "HTTPS")
+    Rel(portal, ws, "Receives updates from", "WebSocket")
+    Rel(api, sqlite, "Reads/Writes to")
+    Rel(api, harbor, "Downloads artifacts from", "HTTPS")
+    Rel(api, nomad, "Manages cluster via", "HTTP")
+    Rel(api, consul, "Reads/Writes config to", "HTTP")
