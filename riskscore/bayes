@@ -1,0 +1,99 @@
+Role of Trend_score and Bayes in Risk Score Formula
+Based on the documentation and code, here's an explanation of the role of Trend_score and Bayes in the risk score formula:
+Trend_score
+Trend_score adjusts the risk score based on trending patterns across multiple objects. It helps identify when a particular attack pattern is becoming widespread.
+How it works:
+The system tracks how many distinct objects are affected by each rule
+It also tracks how many distinct objects are affected by each combination of (trend key + rule)
+When many objects are affected by the same trend, it indicates a potential widespread attack
+Implementation:
+// Step 5: Apply trend score adjustment
+trendFactor := 1.0
+for _, trend := range event.TrendingData {
+    // If this trend is significant (many objects affected), increase the score
+    if trend.ObjectCount > 10 {
+        trendFactor *= 1.2
+    }
+}
+partial5 := partial4 * trendFactor
+
+How to use it:
+Define trend keys in your configuration (like attack technique, source country, etc.)
+Set appropriate thresholds for when a trend becomes significant (e.g., >10 objects)
+Configure the multiplier (e.g., 1.2) to increase scores for widespread trends
+Bayes
+Bayes adjusts risk scores based on historical incident data, using Bayesian probability to estimate how likely an alert is to be a true incident.
+How it works:
+The system tracks how many alerts from each rule become confirmed incidents
+It calculates the probability P(incident|rule) - the likelihood that an alert from this rule is a true incident
+This probability is used to adjust the risk score
+Implementation:
+This part isn't fully implemented in the provided code, but would look something like:
+
+// CalculateBayesFactor calculates the Bayesian adjustment factor
+func CalculateBayesFactor(ruleID string, totalAlerts, confirmedIncidents int64) float64 {
+    // Add a small prior to avoid division by zero
+    prior := 0.01
+    
+    // Calculate P(incident|rule) with smoothing
+    if totalAlerts == 0 {
+        return 1.0 // Default neutral factor
+    }
+    
+    // Calculate probability with Laplace smoothing
+    probability := (float64(confirmedIncidents) + prior) / (float64(totalAlerts) + 2*prior)
+    
+    // Convert to a multiplier (e.g., range 0.5 to 2.0)
+    // Rules with high incident rates get higher multipliers
+    return 0.5 + 1.5*probability
+}
+
+How to use it:
+Track which alerts become confirmed incidents in your system
+Store this data in Redis with keys like rule_stats:incident:<rule_id>
+When calculating risk scores, apply the Bayes factor:
+
+partial_bayes = partial_previous * bayesFactor
+
+Rules with historically high true positive rates will get higher scores
+Integration into the Formula
+To fully implement these factors, you would update the calculateAdjustedScore method:
+
+// calculateAdjustedScore calculates the adjusted score based on rule statistics
+func (a *Accumulator) calculateAdjustedScore(event session.SessionEvent) float64 {
+    // Steps 1-4 remain the same...
+    
+    // Step 5: Apply trend score adjustment
+    trendFactor := 1.0
+    for _, trend := range event.TrendingData {
+        if trend.ObjectCount > 10 {
+            trendFactor *= a.config.TrendMultiplier
+        }
+    }
+    partial5 := partial4 * trendFactor
+    
+    // Step 6: Apply Bayesian adjustment
+    bayesFactor := 1.0
+    totalAlerts, confirmedIncidents, err := a.redis.GetRuleIncidentStats(
+        context.Background(), 
+        event.RuleID,
+    )
+    if err == nil && totalAlerts > 0 {
+        bayesFactor = CalculateBayesFactor(event.RuleID, totalAlerts, confirmedIncidents)
+    }
+    partial6 := partial5 * bayesFactor
+    
+    // Apply importance factor and max cap
+    importanceFactor := 1.0
+    if factor, ok := event.SessionData["asset_importance"].(float64); ok {
+        importanceFactor = factor
+    }
+    
+    finalScore := partial6 * importanceFactor
+    return math.Min(finalScore, a.config.MaxScore)
+}
+
+Benefits
+Trend_score: Helps identify widespread attacks affecting many systems, even if individual alerts have moderate scores
+Bayes: Reduces false positives by learning from historical data which rules tend to produce true incidents
+Both factors help make the risk scoring system more intelligent and adaptive over time.
