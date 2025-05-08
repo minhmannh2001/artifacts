@@ -1,0 +1,65 @@
+Redis Data Types in Risk Score Service
+Based on the codebase, here's a comprehensive list of Redis data types used, their meanings, and usage:
+1. HASH - Session Data
+Key Pattern: session:{tenant}_{objectType}_{objectValue}
+Purpose: Stores session information for each object being monitored.
+Fields:
+session_id: Unique identifier for the session
+start_time: When the session started
+total_score: Accumulated risk score for the session
+alert_list: JSON array of alerts in this session
+session_type: "batch" or "density" (timeout-based)
+Usage: Tracks risk score accumulation for objects over time, with configurable TTL based on session type.
+2. SET - Rule Stats Object Count
+Key Pattern: rule_stats:{ruleID}:{timeBucket}:count
+Purpose: Stores unique objects affected by a specific rule in a time period.
+Members: Set of {objectType}_{objectValue} strings
+Usage: Used to calculate rule dispersion (n) - how many different objects a rule affects.
+3. STRING - Rule Alert Count
+Key Pattern: rule_stats:{ruleID}:{timeBucket}:alert_count
+Purpose: Counts total alerts for a rule in a time bucket.
+Value: Integer count
+Usage: Used to calculate rule frequency (f(t)) - how often a rule fires.
+4. SET - Trend Rule Stats
+Key Pattern: rule_stats:{ruleID}_{trendKey}_{trendValue}:{timeBucket}:count
+Purpose: Tracks unique objects affected by a rule with specific trend key values.
+Members: Set of {objectType}_{objectValue} strings
+Usage: Used for trend analysis and adjusting risk scores based on trend patterns.
+5. HASH - Incident Stats
+Key Pattern: rule_stats:incident
+Purpose: Tracks confirmed incidents per rule.
+Fields: Rule IDs as field names, incident counts as values
+Usage: Used for Bayesian adjustment of risk scores based on true positive rates.
+6. SORTED SET - Recent Alerts
+Key Pattern: object:{tenant}:{globalObject}:{globalValue}:recent_alerts
+Purpose: Tracks recent alerts for an object in time order.
+Score: Timestamp in milliseconds
+Members: {ruleID}:{timestamp} strings
+Usage: Used for time proximity calculations in risk scoring.
+7. HASH - Baseline Stats
+Key Pattern: baseline:{tenant}:{objectType}:{objectValue}
+Purpose: Stores baseline risk metrics for comparison.
+Fields:
+avg_score_7d: Average score over 7 days
+avg_score_1d: Average score over 1 day
+last_update: When baseline was last updated
+Usage: Used to detect deviations from normal behavior patterns.
+8. HYPERLOGLOG (Optional Alternative)
+Key Pattern: rule_stats_hll:{ruleID}:{timeBucket}
+Purpose: Memory-efficient approximation of unique object count.
+Usage: Alternative to SET for high-cardinality rule stats when exact counts aren't required.
+Key Design Principles
+Time Bucketing: Data is organized into time buckets (e.g., "6h") for efficient temporal analysis.
+TTL Management:
+Session keys expire based on session type (24h for batch, 3min for density)
+Stats keys expire after the profile time (e.g., 7 days)
+Composite Keys: Keys combine multiple identifiers (tenant, object type, rule ID, etc.) to create unique namespaces.
+Memory Optimization:
+JSON serialization for complex data
+Optional HyperLogLog for high-cardinality sets
+Appropriate TTLs to prevent memory growth
+Access Patterns:
+Fast lookups for session data during event processing
+Efficient aggregation of rule statistics for risk score calculation
+Time-series analysis through bucketed data
+This Redis data model supports the core functionalities of risk score calculation, session management, trend analysis, and statistical tracking needed for the security analytics system.
