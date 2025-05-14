@@ -1,0 +1,457 @@
+Free List: Recycle & Reuse - Detailed Explanation
+This chapter covers how databases efficiently reuse space from deleted pages, which is crucial for long-term database performance. Let's break it down in detail.
+1. Memory Management Fundamentals
+The Problem
+In a database with a copy-on-write B+tree:
+Each update creates new pages
+Old pages become unused
+Without reuse, the database would grow indefinitely
+
+// Without page reuse:
+// 1. Initial state: 10 pages
+// 2. Update key: Creates 3 new pages (new root, internal node, leaf)
+// 3. Old pages are abandoned
+// 4. Database now has 13 pages, with 3 unused
+// 5. Repeat many times → database size grows unnecessarily
+
+Memory Management Approaches
+The chapter discusses two main approaches:
+Embedded (Intrusive) Linked List:
+Store "next" pointers inside the unused pages themselves
+No extra space needed for the list structure
+Problem: Conflicts with copy-on-write (modifies pages in-place)
+External List:
+Store pointers to unused pages in a separate data structure
+Challenge: How to manage the space used by this list itself
+2. Linked List on Disk
+Requirements for the Free List
+The free list needs special properties:
+// Free list requirements:
+// 1. Must be page-based (to manage itself)
+// 2. Must handle both additions and removals efficiently
+// 3. Must work with copy-on-write principles
+// 4. Must be crash-safe
+Unrolled Linked List Design
+The solution is an unrolled linked list:
+// Node format:
+// | next_ptr | page_ptrs[] | unused_space |
+// |   8B     |   n*8B      |     ...      |
+
+const FREE_LIST_HEADER = 8                                // Size of next pointer
+const FREE_LIST_CAP = (BTREE_PAGE_SIZE - FREE_LIST_HEADER) / 8  // Number of pointers per page
+
+// Each node can store multiple page pointers (typically hundreds)
+// Items are added to the tail and consumed from the head
+
+Key Design Points
+Structure:
+Each node has a pointer to the next node
+Each node can store multiple page pointers (FREE_LIST_CAP)
+Meta page stores pointers to both head and tail nodes
+Operations:
+Add freed pages to the tail
+Take pages for reuse from the head
+When a head node becomes empty, it's recycled (added to the tail)
+In-place Updates:
+Unlike the B+tree nodes, free list nodes are updated in-place
+But crucially, no data is overwritten within a page
+Updates are append-only within each node
+3. Free List Implementation
+Data Structure
+
+type FreeList struct {
+    // Callbacks for managing on-disk pages
+    get func(uint64) []byte      // Read a page
+    new func([]byte) uint64      // Append a new page
+    set func(uint64) []byte      // Update an existing page
+    
+    // Persisted data in the meta page
+    headPage uint64              // Pointer to the list head node
+    headSeq uint64               // Sequence number for indexing into head node
+    tailPage uint64              // Pointer to the list tail node
+    tailSeq uint64               // Sequence number for indexing into tail node
+    
+    // In-memory state
+    maxSeq int64                 // Saved tailSeq to prevent consuming newly added items
+}
+
+Sequence Numbers
+A clever aspect of the design is using monotonically increasing sequence numbers
+
+// Convert a sequence number to an index within a node
+func seq2idx(seq uint64) int {
+    return int(seq % FREE_LIST_CAP)
+}
+
+// Example:
+// If FREE_LIST_CAP = 500:
+// seq 0 → index 0
+// seq 1 → index 1
+// ...
+// seq 499 → index 499
+// seq 500 → index 0 (wraps around to next node)
+// seq 501 → index 1
+
+The sequence numbers serve two purposes:
+They provide a unique identifier for each position in the list
+They make it easy to determine when a node is full or empty
+Preventing Tail Chasing
+During an update transaction, the free list is both:
+Added to (when pages are freed)
+Removed from (when pages are needed)
+To prevent consuming pages that were just freed in the same transaction:
+
+// At the beginning of an update:
+fl.maxSeq = fl.tailSeq  // Remember where the tail was
+
+// During the update:
+// headSeq can only advance up to maxSeq, not to the current tailSeq
+// This prevents consuming pages freed during this transaction
+
+// At the end of the update:
+fl.SetMaxSeq()  // Make newly added items available for the next transaction
+
+Pop Operation (Consuming Pages)
+
+// Remove one item from the head node
+func (fl *FreeList) PopHead() uint64 {
+    // Check if we can advance (prevent consuming newly added items)
+    if fl.headSeq == fl.maxSeq {
+        return 0  // Cannot advance
+    }
+    
+    // Get the head node
+    node := LNode(fl.get(fl.headPage))
+    
+    // Get the page pointer at the current position
+    ptr := node.getPtr(seq2idx(fl.headSeq))
+    
+    // Advance the sequence number
+    fl.headSeq++
+    
+    // If we've consumed all items in this node, move to the next node
+    if seq2idx(fl.headSeq) == 0 {
+        head := fl.headPage
+        fl.headPage = node.getNext()
+        
+        // The list should never be empty
+        assert(fl.headPage != 0)
+        
+        // Recycle the empty head node by adding it to the tail
+        fl.PushTail(head)
+    }
+    
+    return ptr
+}
+
+Push Operation (Adding Pages)
+
+// Add one item to the tail
+func (fl *FreeList) PushTail(ptr uint64) {
+    // Add the page pointer to the tail node
+    node := LNode(fl.set(fl.tailPage))
+    node.setPtr(seq2idx(fl.tailSeq), ptr)
+    
+    // Advance the sequence number
+    fl.tailSeq++
+    
+    // If the tail node is now full, add a new tail node
+    if seq2idx(fl.tailSeq) == 0 {
+        // Try to reuse a page from the free list itself
+        next, head := flPop(fl)
+        
+        // If no page available, allocate a new one
+        if next == 0 {
+            next = fl.new(make([]byte, BTREE_PAGE_SIZE))
+        }
+        
+        // Link the current tail to the new tail
+        LNode(fl.set(fl.tailPage)).setNext(next)
+        fl.tailPage = next
+        
+        // If we removed a head node, add it to the new tail
+        if head != 0 {
+            LNode(fl.set(fl.tailPage)).setPtr(0, head)
+            fl.tailSeq++
+        }
+    }
+}
+
+4. Integration with the KV Store
+Page Management Changes
+With the free list, the page management system needs updates:
+
+type KV struct {
+    // ...
+    page struct {
+        flushed uint64              // Database size in number of pages
+        nappend uint64              // Number of pages to be appended
+        updates map[uint64][]byte   // Pending updates, including appended pages
+    }
+    // ...
+}
+
+// Allocate a new page (used by B+tree)
+func (db *KV) pageAlloc(node []byte) uint64 {
+    // Try to get a page from the free list first
+    if ptr := db.free.PopHead(); ptr != 0 {
+        db.page.updates[ptr] = node
+        return ptr
+    }
+    
+    // If free list is empty, append a new page
+    return db.pageAppend(node)
+}
+
+// Update an existing page (used by free list)
+func (db *KV) pageWrite(ptr uint64) []byte {
+    // Check if there's already a pending update
+    if node, ok := db.page.updates[ptr]; ok {
+        return node
+    }
+    
+    // Create a new buffer and copy the current page content
+    node := make([]byte, BTREE_PAGE_SIZE)
+    copy(node, db.pageReadFile(ptr))
+    
+    // Store in the updates map
+    db.page.updates[ptr] = node
+    return node
+}
+
+// Read a page (used by both B+tree and free list)
+func (db *KV) pageRead(ptr uint64) []byte {
+    // Check for pending updates first
+    if node, ok := db.page.updates[ptr]; ok {
+        return node
+    }
+    
+    // Otherwise read from the file
+    return db.pageReadFile(ptr)
+}
+
+Meta Page Updates
+The meta page format is extended to include free list information:
+
+// Meta page format:
+// | signature | root_ptr | page_used | head_page | head_seq | tail_page | tail_seq |
+// |    16B    |    8B    |    8B     |    8B     |    8B    |    8B     |    8B    |
+
+// Initialize an empty database
+func readRoot(db *KV, fileSize int64) error {
+    if fileSize == 0 {  // Empty file
+        // Reserve 2 pages: meta page and initial free list node
+        db.page.flushed = 2
+        
+        // Set up the free list with one empty node
+        db.free.headPage = 1  // The 2nd page
+        db.free.tailPage = 1
+        
+        return nil  // Meta page will be written in the first update
+    }
+    
+    // ... read existing meta page ...
+}
+
+// Update the database file
+func updateFile(db *KV) error {
+    // ... write changes to disk ...
+    
+    // Prepare the free list for the next update
+    db.free.SetMaxSeq()
+    
+    return nil
+}
+
+5. Key Insights and Implementation Details
+Self-Management
+The free list is self-managing in two ways:
+Node Recycling: When a head node becomes empty, it's added back to the tail
+Growth Management: When a new tail node is needed, it tries to get one from itself first
+
+// The free list manages its own growth:
+// 1. When it needs a new node, it tries to get one from itself
+// 2. Only if that fails does it allocate a new page
+// 3. When a node becomes empty, it's recycled
+
+// This creates a balanced system where:
+// - The free list size is proportional to the number of free pages
+// - The overhead is minimal
+
+In-Place Updates vs. Copy-on-Write
+The free list uses in-place updates, which seems to contradict copy-on-write principles, but:
+
+// Free list updates are safe because:
+// 1. No data is overwritten within a page (append-only within the page)
+// 2. The meta page is still updated atomically
+// 3. If an update is interrupted, the meta page still points to valid data
+
+// This means:
+// - No special crash recovery is needed
+// - The database remains consistent
+
+Never Empty
+The free list is designed to always have at least one node:
+
+// The free list is never empty because:
+// 1. It's initialized with one node
+// 2. When the tail node is full, a new one is added before it's needed
+// 3. When the head node becomes empty, we move to the next node first
+
+// This avoids special cases for an empty list
+assert(fl.headPage != 0)  // The list should never be empty
+
+Transaction Boundaries
+The free list handles transaction boundaries carefully:
+
+// At transaction boundaries:
+// 1. At the start: maxSeq = tailSeq (remember current tail position)
+// 2. During transaction: headSeq can't advance past maxSeq
+// 3. At the end: SetMaxSeq() (make newly added items available)
+
+// This ensures:
+// - Pages freed in the current transaction aren't reused immediately
+// - Pages freed in previous transactions are available for reuse
+
+6. Practical Implementation Example
+Here's a simplified but complete implementation of the free list:
+
+package main
+
+import (
+    "encoding/binary"
+    "fmt"
+)
+
+const (
+    BTREE_PAGE_SIZE  = 4096
+    FREE_LIST_HEADER = 8
+    FREE_LIST_CAP    = (BTREE_PAGE_SIZE - FREE_LIST_HEADER) / 8
+)
+
+// LNode represents a free list node
+type LNode []byte
+
+// Get the next node pointer
+func (node LNode) getNext() uint64 {
+    return binary.LittleEndian.Uint64(node[:8])
+}
+
+// Set the next node pointer
+func (node LNode) setNext(next uint64) {
+    binary.LittleEndian.PutUint64(node[:8], next)
+}
+
+// Get a page pointer at index
+func (node LNode) getPtr(idx int) uint64 {
+    offset := FREE_LIST_HEADER + idx*8
+    return binary.LittleEndian.Uint64(node[offset : offset+8])
+}
+
+// Set a page pointer at index
+func (node LNode) setPtr(idx int, ptr uint64) {
+    offset := FREE_LIST_HEADER + idx*8
+    binary.LittleEndian.PutUint64(node[offset:offset+8], ptr)
+}
+
+// FreeList manages unused pages
+type FreeList struct {
+    // Callbacks for managing on-disk pages
+    get func(uint64) []byte      // Read a page
+    new func([]byte) uint64      // Append a new page
+    set func(uint64) []byte      // Update an existing page
+    
+    // Persisted data in the meta page
+    headPage uint64              // Pointer to the list head node
+    headSeq  uint64              // Sequence number for indexing into head node
+    tailPage uint64              // Pointer to the list tail node
+    tailSeq  uint64              // Sequence number for indexing into tail node
+    
+    // In-memory state
+    maxSeq   uint64              // Saved tailSeq to prevent consuming newly added items
+}
+
+// Convert a sequence number to an index within a node
+func seq2idx(seq uint64) int {
+    return int(seq % FREE_LIST_CAP)
+}
+
+// Make newly added items available for consumption
+func (fl *FreeList) SetMaxSeq() {
+    fl.maxSeq = fl.tailSeq
+}
+
+// Internal function to pop an item from the head
+func flPop(fl *FreeList) (ptr uint64, head uint64) {
+    if fl.headSeq == fl.maxSeq {
+        return 0, 0 // Cannot advance
+    }
+    
+    node := LNode(fl.get(fl.headPage))
+    ptr = node.getPtr(seq2idx(fl.headSeq))
+    fl.headSeq++
+    
+    // Move to the next node if the head node is empty
+    if seq2idx(fl.headSeq) == 0 {
+        head, fl.headPage = fl.headPage, node.getNext()
+        if fl.headPage == 0 {
+            panic("free list should never be empty")
+        }
+    }
+    
+    return
+}
+
+// Get one item from the list head
+func (fl *FreeList) PopHead() uint64 {
+    ptr, head := flPop(fl)
+    if head != 0 { // Recycle the empty head node
+        fl.PushTail(head)
+    }
+    return ptr
+}
+
+// Add one item to the tail
+func (fl *FreeList) PushTail(ptr uint64) {
+    // Add the item to the tail node
+    node := LNode(fl.set(fl.tailPage))
+    node.setPtr(seq2idx(fl.tailSeq), ptr)
+    fl.tailSeq++
+    
+    // Add a new tail node if the current one is full
+    if seq2idx(fl.tailSeq) == 0 {
+        // Try to reuse from the list head
+        next, head := flPop(fl)
+        if next == 0 {
+            // Or allocate a new node
+            next = fl.new(make([]byte, BTREE_PAGE_SIZE))
+        }
+        
+        // Link to the new tail node
+        node.setNext(next)
+        fl.tailPage = next
+        
+        // Also add the head node if it was removed
+        if head != 0 {
+            LNode(fl.set(fl.tailPage)).setPtr(0, head)
+            fl.tailSeq++
+        }
+    }
+}
+
+// Initialize a new free list
+func NewFreeList(get func(uint64) []byte, new func([]byte) uint64, set func(uint64) []byte) *FreeList {
+    fl := &FreeList{
+        get:     get,
+        new:     new,
+        set:     set,
+        headPage: 0,
+        headSeq:  0,
+        tailPage: 0,
+        tailSeq:  0,
+        maxSeq:   0,
+    }
+    return fl
+}
+
+// Example usage
